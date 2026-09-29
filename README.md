@@ -78,7 +78,8 @@ Use a US region: the model APIs are served from the US, so each model call saves
 | `ANTHROPIC_MODEL` | `claude-opus-5` | Most accurate in practice. `claude-haiku-4-5` is faster but less reliable |
 | `GEMINI_MODEL` / `GEMINI_FALLBACK_MODEL` | `gemini-2.5-flash` / `gemini-flash-lite-latest` | Fallback is used automatically on 429/503 for five minutes |
 | `OPENAI_BASE_URL` | | Point at OpenRouter, Groq or Ollama for any Chat Completions server |
-| `STT_PROVIDER` | `auto` | `deepgram` streams the mic to Nova-3 with 300 ms endpointing; `browser` uses Chrome's Web Speech API |
+| `STT_PROVIDER` | `auto` | `deepgram` streams the mic to Nova-3; `browser` uses Chrome's Web Speech API |
+| `STT_ENDPOINTING_MS` / `STT_FINAL_GRACE_MS` | `300` / `500` | Silence that ends an utterance, plus a grace period so a mid-sentence pause ("… for Friday") doesn't split it |
 | `TTS_PROVIDER` | `auto` | `deepgram` (free credit, no card), `google` (needs billing), `browser` |
 | `ACK_ENABLED` | `true` | Play a cached "Okay." the instant the user stops talking |
 | `SPECULATION_ENABLED` | `false` | Start the model on the interim transcript. Doubles model calls on a miss; keep off on free tiers |

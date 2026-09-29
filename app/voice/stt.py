@@ -73,9 +73,15 @@ class DeepgramSTT:
         sample_rate: int = 24000,
         endpointing_ms: int = 300,
         language: str = "en",
+        final_grace_ms: int = 500,
     ):
         self.api_key = api_key
         self.on_event = on_event
+        # After Deepgram declares an utterance final, wait this long for the speaker to continue ("...for Friday")
+        # before running the turn; anything that arrives in the meantime is merged into the same utterance.
+        self.final_grace_s = final_grace_ms / 1000
+        self._pending_final: tuple[str, int] | None = None
+        self._grace_task: asyncio.Task | None = None
         self.params = {
             "model": model,
             "language": language,
@@ -127,6 +133,7 @@ class DeepgramSTT:
                 self.receiver.cancel()
         finally:
             await ws.close()
+            await self._flush_pending()  # the mic is closing: whatever was said is the utterance
 
     async def _receive(self) -> None:
         if self.ws is None:
@@ -135,10 +142,50 @@ class DeepgramSTT:
             async for raw in self.ws:
                 if isinstance(raw, bytes):
                     continue
-                for event in self.aggregator.handle(json.loads(raw)):
-                    await self.on_event(event)
+                await self.handle_message(json.loads(raw))
         except websockets.ConnectionClosed:
             pass
         except Exception as exc:
             log.warning("STT session error: %s", exc)
             await self.on_event(("error", str(exc)))
+
+    async def handle_message(self, message: dict) -> None:
+        """Route one Deepgram message, holding finals for the grace period so pauses don't split sentences."""
+        events = self.aggregator.handle(message)
+        has_words = False
+        if message.get("type") == "Results":  # UtteranceEnd carries `channel` as a list, so check the type first
+            alt = ((message.get("channel") or {}).get("alternatives") or [{}])[0]
+            has_words = bool((alt.get("transcript") or "").strip())
+        if self._pending_final and (has_words or message.get("type") == "SpeechStarted"):
+            # The speaker continued: pull the held text back in front of what follows.
+            self._cancel_grace()
+            held, _ = self._pending_final
+            self._pending_final = None
+            self.aggregator.finals.insert(0, held)
+            events = [
+                (k, " ".join([held, *rest[0:1]]), *rest[1:]) if k == "partial" else (k, *rest) for k, *rest in events
+            ]
+            events = [e if e[0] != "final" else ("final", f"{held} {e[1]}".strip(), e[2]) for e in events]
+        for event in events:
+            if event[0] == "final":
+                self._pending_final = (event[1], event[2])
+                self._cancel_grace()
+                self._grace_task = asyncio.create_task(self._emit_after_grace())
+            else:
+                await self.on_event(event)
+
+    async def _emit_after_grace(self) -> None:
+        await asyncio.sleep(self.final_grace_s)
+        await self._flush_pending(extra_ms=int(self.final_grace_s * 1000))
+
+    async def _flush_pending(self, extra_ms: int = 0) -> None:
+        pending, self._pending_final = self._pending_final, None
+        self._cancel_grace(current=True)
+        if pending:
+            text, ago = pending
+            await self.on_event(("final", text, ago + extra_ms))
+
+    def _cancel_grace(self, current: bool = False) -> None:
+        task, self._grace_task = self._grace_task, None
+        if task and not task.done() and not (current and task is asyncio.current_task()):
+            task.cancel()

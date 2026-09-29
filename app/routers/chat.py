@@ -121,6 +121,7 @@ async def ws_endpoint(ws: WebSocket):
                     rt.settings.deepgram_stt_model,
                     int(msg.get("sample_rate") or rt.settings.tts_sample_rate),
                     rt.settings.stt_endpointing_ms,
+                    final_grace_ms=rt.settings.stt_final_grace_ms,
                 )
                 try:
                     await stt.start()

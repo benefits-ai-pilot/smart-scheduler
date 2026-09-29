@@ -38,7 +38,7 @@
     const audio = ac.createBuffer(1, f32.length, state.sampleRate); audio.copyToChannel(f32, 0);
     const src = ac.createBufferSource(); src.buffer = audio; src.connect(ac.destination);
     const startAt = Math.max(ac.currentTime + 0.02, nextTime); src.start(startAt); nextTime = startAt + audio.duration;
-    sources.push(src); src.onended = () => { sources = sources.filter((s) => s !== src); if (!sources.length && state.speaking) onSpeechDone(); };
+    sources.push(src); src.onended = () => { sources = sources.filter((s) => s !== src); if (!sources.length && state.audioDone) onSpeechDone(); };
     return performance.now() + (startAt - ac.currentTime) * 1000;  // when this chunk will actually be heard
   };
   const stopAudio = () => { sources.forEach((s) => { try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
@@ -166,7 +166,11 @@
           if (!state.listenAfter && state.listening) stopListening();  // e.g. the mic was still open while the user typed "book it"
           if (state.botEl) state.botEl.textContent = m.text || state.botText;
           if (!state.serverTTS) { state.speaking = true; speakBrowser(m.text); } break;
-        case "audio_end": if (state.serverTTS && !sources.length) onSpeechDone(); break;
+        case "audio_end":
+          // No more reply audio is coming. Finish the turn now if playback already drained, else when the last chunk ends.
+          state.audioDone = true;
+          if (state.serverTTS && !sources.length) onSpeechDone();
+          break;
         case "tts_error": if (!state.speaking) speakBrowser(state.botText); break;
         case "error":
           clearTimeout(state.watchdog);
@@ -183,7 +187,7 @@
     stopAudio(); if (state.speaking && send) state.ws.send(JSON.stringify({ type: "cancel" }));
     state.speaking = false; mic.classList.remove("speaking");
     addMsg("user", text); state.botEl = null; state.botText = ""; state.audioRole = "reply"; state.lastPartial = ""; clearTimeout(state.partialTimer);
-    resetTiming(sentAt); state.speechEndAt = 0; state.turnFinished = false; state.listenAfter = true;
+    resetTiming(sentAt); state.speechEndAt = 0; state.turnFinished = false; state.listenAfter = true; state.audioDone = false;
     clearTimeout(state.watchdog);
     state.watchdog = setTimeout(() => {
       if (!state.botText) addMsg("error", "No response from the model after 20 s. On the Gemini free tier this usually means the rate limit is exhausted; wait a minute and try again.");

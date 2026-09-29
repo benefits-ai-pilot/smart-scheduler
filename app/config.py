@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     )
     deepgram_stt_model: str = "nova-3"
     stt_endpointing_ms: int = 300  # silence that ends an utterance; the browser's own recogniser waits ~1 s
+    stt_final_grace_ms: int = 500  # extra wait after that, so "I want a meeting ... for Friday" stays one utterance
     tts_enabled: bool = True
     tts_provider: str = "auto"  # auto | deepgram | google | browser  (auto = deepgram if its key is set, else google)
     deepgram_api_key: str = ""

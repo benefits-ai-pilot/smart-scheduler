@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 ACK_PHRASES = ["Okay.", "Sure.", "Mm-hm."]
 MIN_SPECULATION_WORDS = 2
-IDLE_FLUSH_S = 0.3  # tokens paused this long -> speak the clause we have rather than wait for the sentence
+IDLE_FLUSH_S = 0.6  # tokens paused this long -> speak the clause we have rather than wait for the sentence
 
 Sender = Callable[[Any], Awaitable[None]]  # sends a dict (JSON) or bytes (audio) to the client
 
