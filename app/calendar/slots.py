@@ -135,6 +135,42 @@ def find_free_slots(busy: list[BusyPeriod], query: SlotQuery, now: datetime | No
     return slots
 
 
+def free_blocks(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None = None) -> list[dict]:
+    """Free intervals (within the query's hours) per day of the window, regardless of the meeting length.
+
+    Lets the agent say "Monday afternoon is free" or "you have 2 to 5 open" instead of listing arbitrary starts."""
+    tz = query.window_start.tzinfo
+    buffer = timedelta(minutes=query.buffer_minutes)
+    busy_iv = _merge([(b.start.astimezone(tz) - buffer, b.end.astimezone(tz) + buffer) for b in busy])
+    out: list[dict] = []
+    day = query.window_start.astimezone(tz).date()
+    last_day = query.window_end.astimezone(tz).date()
+    while day <= last_day:
+        weekday = day.weekday()
+        skip = (
+            weekday in query.exclude_weekdays
+            or (weekday >= 5 and not query.include_weekends)
+            or day in query.exclude_dates
+        )
+        if not skip:
+            day_start = max(datetime.combine(day, _hour_to_time(query.earliest_hour), tzinfo=tz), query.window_start)
+            day_end = min(datetime.combine(day, _hour_to_time(query.latest_hour), tzinfo=tz), query.window_end)
+            if now is not None:
+                day_start = max(day_start, now.astimezone(tz))
+            for free_start, free_end in _free_intervals(day_start, day_end, busy_iv):
+                if free_end - free_start >= query.duration:
+                    out.append(
+                        {
+                            "date": day.isoformat(),
+                            "from": _fmt_time(free_start),
+                            "to": _fmt_time(free_end),
+                            "minutes": int((free_end - free_start).total_seconds() // 60),
+                        }
+                    )
+        day += timedelta(days=1)
+    return out
+
+
 def find_alternatives(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None = None) -> list[dict]:
     """When the strict query yields nothing, try progressively relaxed queries.
 

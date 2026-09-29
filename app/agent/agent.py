@@ -52,12 +52,28 @@ class Agent:
         self.step_minutes = step_minutes
         self.tools = ToolRunner(calendar, session, work_start, work_end, step_minutes, commit_gate)
         self.owner: str | None = None  # browser uid that created this agent (used to drop sessions on calendar swap)
+        self._refresh_task: asyncio.Task | None = None
 
     def fork(self, commit_gate: asyncio.Event) -> Agent:
         """A speculative copy: same LLM/calendar, copied session, side-effect tools held behind the gate."""
         return Agent(
             self.llm, self.calendar, self.session.copy(), self.work_start, self.work_end, self.step_minutes, commit_gate
         )
+
+    def refresh_snapshot_in_background(self) -> None:
+        """Re-read the calendar without blocking the current turn (stale-while-revalidate)."""
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self.refresh_snapshot(force=True))
+
+    async def current_snapshot(self, now: datetime) -> str:
+        """The snapshot for this turn: a cached one at once (refreshing behind the scenes if stale), or a fresh read
+        only when there is none yet, so a calendar round trip is never on the path to the first token."""
+        sess = self.session
+        if sess.snapshot:
+            if time.time() - sess.snapshot_at >= SNAPSHOT_TTL_S:
+                self.refresh_snapshot_in_background()
+            return sess.snapshot
+        return await self.refresh_snapshot(now)
 
     async def refresh_snapshot(self, now: datetime | None = None, force: bool = False) -> str:
         """Read the next two weeks of the calendar into the prompt snapshot (cached for SNAPSHOT_TTL_S)."""
@@ -84,7 +100,7 @@ class Agent:
 
     async def run_turn(self, user_text: str, now: datetime | None = None) -> AsyncIterator[AgentEvent]:
         now = now or datetime.now(self.session.tz)
-        snapshot = await self.refresh_snapshot(now)
+        snapshot = await self.current_snapshot(now)
         date_context = build_date_context(
             now, self.session.tz, self.work_start, self.work_end, self.session.preferences
         )
@@ -116,6 +132,8 @@ class Agent:
                 results.append((call, result))
             msgs = self.llm.tool_results(results)
             self.session.history.extend(msgs if isinstance(msgs, list) else [msgs])
+            if any(c.name == "create_event" and "created" in r for c, r in results):
+                self.refresh_snapshot_in_background()  # so the next turn does not offer the slot just booked
 
             # Bookings and preference saves need no second model call to phrase: say it from a template.
             templated = _confirmation(results)

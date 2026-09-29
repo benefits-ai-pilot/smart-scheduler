@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from app.agent.agent import Agent
+from app.agent.tools import SIDE_EFFECT_TOOLS
 
 from .chunker import SentenceChunker
 from .tts import TTS, queue_iter
@@ -28,7 +29,9 @@ log = logging.getLogger(__name__)
 
 ACK_PHRASES = ["Okay.", "Sure.", "Mm-hm."]
 MIN_SPECULATION_WORDS = 2
-IDLE_FLUSH_S = 0.6  # tokens paused this long -> speak the clause we have rather than wait for the sentence
+IDLE_FLUSH_S = 0.4  # tokens paused this long -> speak the clause we have rather than wait for the sentence
+HOLD_FIRST_S = 0.3  # how long a bridge-like first sentence waits to learn whether a booking follows
+BRIDGE_MAX_CHARS = 48  # longer first sentences are real content and are spoken at once
 
 Sender = Callable[[Any], Awaitable[None]]  # sends a dict (JSON) or bytes (audio) to the client
 
@@ -130,13 +133,37 @@ class Turn:
                 events.put_nowait(None)
 
         producer = asyncio.create_task(produce())
+        # The first sentence of a model round is usually a bridge ("Let me check your calendar."). It is held
+        # briefly: dropped if a booking/preference call follows (their confirmation is templated and immediate),
+        # spoken as soon as a read-only tool call, more text, or HOLD_FIRST_S arrives.
+        held: str | None = None
+        held_at = 0.0
+        first_of_round = True
+
+        def release_held() -> None:
+            nonlocal held
+            if held is not None:
+                sentences.put_nowait(held)
+                held = None
+
+        def queue(sentence: str) -> None:
+            nonlocal held, held_at, first_of_round
+            if first_of_round and held is None and len(sentence) <= BRIDGE_MAX_CHARS:
+                held, held_at, first_of_round = sentence, time.perf_counter(), False  # could be a bridge: wait a beat
+                return
+            release_held()
+            first_of_round = False
+            sentences.put_nowait(sentence)
+
         try:
             while True:
                 try:
                     ev = await asyncio.wait_for(events.get(), IDLE_FLUSH_S)
                 except TimeoutError:
+                    if held is not None and time.perf_counter() - held_at >= HOLD_FIRST_S:
+                        release_held()
                     for s in chunker.idle_flush():
-                        sentences.put_nowait(s)
+                        queue(s)
                     continue
                 if ev is None:
                     break
@@ -145,14 +172,23 @@ class Turn:
                 if ev.type == "text":
                     await self._emit({"type": "token", "text": ev.data})
                     for s in chunker.feed(ev.data):
-                        sentences.put_nowait(s)
+                        queue(s)
+                    if held is not None and time.perf_counter() - held_at >= HOLD_FIRST_S:
+                        release_held()
                 elif ev.type == "tool_call":
-                    for s in chunker.flush():  # say "Let me check..." while the tool runs
-                        sentences.put_nowait(s)
+                    if ev.data["name"] in SIDE_EFFECT_TOOLS:
+                        held = None  # the bridge would only collide with the templated confirmation
+                        chunker.flush()
+                    else:
+                        release_held()
+                        for s in chunker.flush():  # say "Let me check..." while the tool runs
+                            sentences.put_nowait(s)
                     await self._emit({"type": "tool_call", **ev.data})
                 elif ev.type == "tool_result":
+                    first_of_round = True  # the next model round starts fresh
                     await self._emit({"type": "tool_result", **ev.data})
                 elif ev.type == "done":
+                    release_held()
                     for s in chunker.flush():
                         sentences.put_nowait(s)
                     if tts is None:

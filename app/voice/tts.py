@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import Protocol
 
@@ -22,6 +23,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+CACHE_SENTENCES = 200  # ~1 s of 24 kHz PCM is 48 KB; 200 entries stay under 10 MB
 KEEPALIVE = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=600.0)
 
 
@@ -106,6 +108,7 @@ class DeepgramTTS:
         )
         self.voice = voice
         self.sample_rate = sample_rate
+        self._cache: OrderedDict[str, bytes] = OrderedDict()
 
     @property
     def _params(self) -> dict:
@@ -124,8 +127,24 @@ class DeepgramTTS:
     async def synthesize_stream(self, sentences: AsyncIterator[str]) -> AsyncIterator[bytes]:
         async for text in sentences:
             if text.strip():
-                async for chunk in self._speak(text):
+                async for chunk in self._speak_cached(text):
                     yield chunk
+
+    async def _speak_cached(self, text: str) -> AsyncIterator[bytes]:
+        """Repeated sentences (bridges, standard questions) come straight from memory the second time."""
+        key = text.strip()
+        cached = self._cache.get(key)
+        if cached is not None:
+            self._cache.move_to_end(key)
+            yield cached
+            return
+        parts: list[bytes] = []
+        async for chunk in self._speak(text):
+            parts.append(chunk)
+            yield chunk
+        self._cache[key] = b"".join(parts)
+        while len(self._cache) > CACHE_SENTENCES:
+            self._cache.popitem(last=False)
 
     async def _speak(self, text: str) -> AsyncIterator[bytes]:
         carry = b""  # HTTP chunk boundaries can split a 16-bit sample; never emit an odd number of bytes

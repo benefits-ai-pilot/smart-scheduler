@@ -8,6 +8,7 @@ Disconnecting reverts the visitor to the deployment's default calendar, if one i
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from typing import TYPE_CHECKING, Annotated
@@ -22,10 +23,12 @@ from app.web import UID_COOKIE, browser_uid
 if TYPE_CHECKING:  # avoids a circular import: main.py includes this router
     from app.main import Runtime
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/calendar")
 
-# OAuth `state` values we issued, with their creation time (CSRF protection for the callback).
-_pending_states: dict[str, tuple[str, float]] = {}
+# OAuth `state` values we issued -> (browser uid, created_at, PKCE code_verifier, redirect_uri).
+# The verifier and redirect URI must be reused verbatim in the token exchange, or Google answers invalid_grant.
+_pending_states: dict[str, tuple[str, float, str, str]] = {}
 STATE_TTL_S = 600
 
 
@@ -41,7 +44,7 @@ def _redirect_uri(request: Request, rt: Runtime) -> str:
     return f"{base}/api/calendar/oauth/callback"
 
 
-def _flow(request: Request, rt: Runtime) -> Flow:
+def _flow(rt: Runtime, redirect_uri: str, code_verifier: str | None = None) -> Flow:
     client = rt.oauth_client_config()
     if client is None:
         raise HTTPException(503, "Google sign-in is not configured on this server (GOOGLE_OAUTH_CLIENT_JSON)")
@@ -52,7 +55,15 @@ def _flow(request: Request, rt: Runtime) -> Flow:
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
-    return Flow.from_client_config(config, scopes=SCOPES, redirect_uri=_redirect_uri(request, rt))
+    if code_verifier:  # callback: reuse the verifier that produced the code_challenge in the consent URL
+        return Flow.from_client_config(
+            config,
+            scopes=SCOPES,
+            redirect_uri=redirect_uri,
+            code_verifier=code_verifier,
+            autogenerate_code_verifier=False,
+        )
+    return Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
 
 
 @router.get("/status")
@@ -66,15 +77,16 @@ async def oauth_start(request: Request):
     """Send the visitor to Google's consent screen."""
     rt: Runtime = request.app.state.rt
     uid = _require_uid(request)
-    flow = _flow(request, rt)
+    redirect_uri = _redirect_uri(request, rt)
+    flow = _flow(rt, redirect_uri)
     state = secrets.token_urlsafe(24)
     now = time.time()
-    for key, (_, created) in list(_pending_states.items()):  # expire stale states
-        if now - created > STATE_TTL_S:
+    for key, entry in list(_pending_states.items()):  # expire stale states
+        if now - entry[1] > STATE_TTL_S:
             _pending_states.pop(key, None)
-    _pending_states[state] = (uid, now)
     # offline + consent: guarantees a refresh token so the calendar keeps working after the hour-long access token.
     url, _ = flow.authorization_url(access_type="offline", prompt="consent", include_granted_scopes="true", state=state)
+    _pending_states[state] = (uid, now, flow.code_verifier, redirect_uri)  # verifier exists once the URL is built
     return RedirectResponse(url, status_code=302)
 
 
@@ -85,14 +97,15 @@ async def oauth_callback(request: Request, state: str = "", code: str = "", erro
     entry = _pending_states.pop(state, None)
     if error or entry is None or not code:
         return RedirectResponse(f"/?calendar=error&reason={error or 'invalid_state'}", status_code=302)
-    uid, _ = entry
+    uid, _, code_verifier, redirect_uri = entry
     if uid != browser_uid(request.cookies):
         return RedirectResponse("/?calendar=error&reason=cookie_mismatch", status_code=302)
     try:
-        flow = _flow(request, rt)
+        flow = _flow(rt, redirect_uri, code_verifier)
         flow.fetch_token(code=code)
         await rt.connect_user_calendar(uid, flow.credentials.to_json())
     except Exception as exc:
+        log.warning("Google sign-in failed at token exchange: %s: %s", type(exc).__name__, exc)
         return RedirectResponse(f"/?calendar=error&reason={type(exc).__name__}", status_code=302)
     return RedirectResponse("/?calendar=connected", status_code=302)
 

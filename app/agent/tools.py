@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from app.calendar.base import CalendarClient
-from app.calendar.slots import SlotQuery, find_alternatives, find_free_slots
+from app.calendar.slots import SlotQuery, find_alternatives, find_free_slots, free_blocks
 
 from .llm import ToolSpec
 from .session import Session
@@ -19,14 +20,14 @@ log = logging.getLogger(__name__)
 
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
-_ISO = {"type": "string", "description": "ISO 8601 datetime with offset, e.g. 2026-09-29T13:00:00+05:30"}
+_ISO = {"type": "string", "description": "ISO 8601 datetime with offset"}
 
 TOOL_SPECS = [
     ToolSpec(
         name="find_available_slots",
         description=(
-            "Find free meeting slots on the user's calendar within a time window. Returns up to max_results slots, "
-            "the busy events in the window (to explain conflicts), and `alternatives` when nothing fits."
+            "Free meeting slots in a time window: up to max_results slots, the busy events there, free_blocks, "
+            "total_available, and alternatives when nothing fits."
         ),
         input_schema={
             "type": "object",
@@ -36,35 +37,35 @@ TOOL_SPECS = [
                 "duration_minutes": {"type": "integer", "description": "Meeting length in minutes"},
                 "earliest_hour": {
                     "type": "number",
-                    "description": "Earliest start hour, 24h (9.5 = 09:30). Default: working-day start",
+                    "description": "Earliest start hour, 24h (9.5 = 09:30)",
                 },
-                "latest_hour": {"type": "number", "description": "Latest end hour, 24h. Default: working-day end"},
+                "latest_hour": {"type": "number", "description": "Latest end hour, 24h"},
                 "exclude_weekdays": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Weekdays to skip, e.g. ['wed']",
                 },
-                "include_weekends": {"type": "boolean", "description": "Allow Saturday/Sunday. Default false"},
+                "include_weekends": {"type": "boolean", "description": "Allow weekends"},
                 "buffer_minutes": {
                     "type": "integer",
-                    "description": "Required free gap before and after neighbouring events",
+                    "description": "Free gap required before/after neighbouring events",
                 },
                 "max_results": {"type": "integer", "description": "Max slots to return (default 3)"},
                 "exclude_holidays": {
                     "type": "boolean",
-                    "description": "Skip public holidays. Default false: holidays are searched and each slot on one is labelled with the holiday name.",
+                    "description": "Skip public holidays (default: searched and labelled)",
                 },
                 "before_event": {
                     "type": "string",
-                    "description": "Keyword of a calendar event that the meeting must END before (e.g. 'flight'). The tool finds it and clips the window.",
+                    "description": "Keyword of an event the meeting must end before (e.g. 'flight'); clips the window",
                 },
                 "after_event": {
                     "type": "string",
-                    "description": "Keyword of a calendar event that the meeting must come AFTER (e.g. 'Project Alpha Kick-off').",
+                    "description": "Keyword of an event the meeting must follow",
                 },
                 "after_event_days": {
                     "type": "integer",
-                    "description": "With after_event: search only this many days following the event's day (default 2).",
+                    "description": "With after_event: days after it to search (default 2)",
                 },
             },
             "required": ["window_start", "window_end", "duration_minutes"],
@@ -73,8 +74,8 @@ TOOL_SPECS = [
     ToolSpec(
         name="find_events",
         description=(
-            "List the user's calendar events in a time range, optionally filtered by a keyword in the title. "
-            "Not needed to anchor a search: use find_available_slots with before_event / after_event instead."
+            "List calendar events in a time range, optionally filtered by a title keyword. "
+            "For anchoring a search use find_available_slots before_event/after_event instead."
         ),
         input_schema={
             "type": "object",
@@ -83,7 +84,7 @@ TOOL_SPECS = [
                 "time_max": _ISO,
                 "query": {
                     "type": "string",
-                    "description": "Keyword(s) to match in the event title, e.g. 'Project Alpha'",
+                    "description": "Keyword to match in the title",
                 },
             },
             "required": ["time_min", "time_max"],
@@ -92,8 +93,8 @@ TOOL_SPECS = [
     ToolSpec(
         name="create_event",
         description=(
-            "Book a meeting on the user's calendar. Refuses a time that overlaps an existing event unless "
-            "override_conflicts=true, and a public holiday unless confirmed_holiday=true; both only after the user agreed."
+            "Book a meeting. Refuses an overlap unless override_conflicts=true and a public holiday unless "
+            "confirmed_holiday=true (both only after the user agreed)."
         ),
         input_schema={
             "type": "object",
@@ -104,11 +105,11 @@ TOOL_SPECS = [
                 "description": {"type": "string"},
                 "override_conflicts": {
                     "type": "boolean",
-                    "description": "Book even though it overlaps an existing event (the existing event is kept). Only when the user asked for that.",
+                    "description": "Book over an existing event (it is kept); only when the user asked",
                 },
                 "confirmed_holiday": {
                     "type": "boolean",
-                    "description": "The user was told the day is a public holiday and still wants it.",
+                    "description": "User was told it is a holiday and still wants it",
                 },
             },
             "required": ["title", "start", "end"],
@@ -210,14 +211,28 @@ class ToolRunner:
         if a.get("exclude_holidays"):
             query.exclude_dates = {h.day for h in holidays}
         slots = find_free_slots(busy, query, now)
+        busy_in_window = [b for b in busy if b.end > start and b.start < end]
+        total_available = len(find_free_slots(busy, replace(query, max_results=200, max_per_day=200), now))
+        blocks = free_blocks(busy, query, now)
         result: dict = {
             "slots": [s.to_dict() for s in slots],
+            "total_available": total_available,
+            "window_is_free": not busy_in_window,
+            "free_blocks": blocks[:10],
             "busy_in_window": [
-                {"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()}
-                for b in busy
-                if b.end > start and b.start < end
+                {"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()} for b in busy_in_window
             ][:12],
         }
+        if not busy_in_window and slots:
+            result["presentation"] = (
+                "The whole window is free: say so in the user's words ('Monday afternoon is free') and ask what time "
+                "suits, instead of listing times."
+            )
+        elif total_available > 3:
+            result["presentation"] = (
+                f"{total_available} slots fit; the free blocks are listed. Do not pick three at random: describe the open "
+                "stretches and ask ONE narrowing question (earlier or later, before or after lunch, which day)."
+            )
         holiday_names = {h.day: h.name for h in holidays}
         for slot, dict_ in zip(slots, result["slots"], strict=True):
             if slot.start.date() in holiday_names:
