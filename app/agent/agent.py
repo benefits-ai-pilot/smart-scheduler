@@ -66,8 +66,16 @@ class Agent:
             return sess.snapshot
         now = now or datetime.now(sess.tz)
         try:
-            busy = await asyncio.to_thread(self.calendar.busy_periods, now, now + timedelta(days=SNAPSHOT_DAYS))
-            sess.snapshot = build_calendar_snapshot(busy, now, sess.tz, self.work_start, self.work_end, SNAPSHOT_DAYS)
+            until = now + timedelta(days=SNAPSHOT_DAYS)
+            busy = await asyncio.to_thread(self.calendar.busy_periods, now, until)
+            try:
+                holidays = await asyncio.to_thread(self.calendar.holidays, now, until)
+            except Exception as exc:  # holiday calendar is a nicety; never block the snapshot on it
+                log.warning("holiday lookup failed: %s", exc)
+                holidays = []
+            sess.snapshot = build_calendar_snapshot(
+                busy, now, sess.tz, self.work_start, self.work_end, SNAPSHOT_DAYS, holidays=holidays
+            )
             sess.snapshot_at = time.time()
         except Exception as exc:  # the tools still work without it
             log.warning("calendar snapshot unavailable: %s", exc)
@@ -152,6 +160,8 @@ def _confirmation(results: list[tuple[ToolCall, dict]]) -> str | None:
                 f"Done, {ev['title']} is booked for {start:%A} the {start.day}{_ordinal(start.day)} at "
                 f"{_spoken_time(start)} for {_spoken_duration(int((end - start).total_seconds() // 60))}."
             )
+            if result.get("holiday"):
+                parts.append(f"Just so you know, that day is {result['holiday']}, a public holiday.")
         elif call.name == "remember_preference":
             parts.append("Noted, I'll remember that.")
     return " ".join(parts) if parts else None

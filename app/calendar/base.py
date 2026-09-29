@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol
 
 
@@ -34,8 +34,19 @@ class BusyPeriod:
     title: str = ""  # optional, used to explain conflicts
 
 
+@dataclass
+class Holiday:
+    day: date
+    name: str
+
+    def to_dict(self) -> dict:
+        return {"date": self.day.isoformat(), "name": self.name}
+
+
 class CalendarClient(Protocol):
     """Blocking calendar operations. The agent wraps them in a thread."""
+
+    def holidays(self, start: datetime, end: datetime) -> list[Holiday]: ...
 
     def busy_periods(self, start: datetime, end: datetime) -> list[BusyPeriod]: ...
 

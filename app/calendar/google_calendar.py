@@ -4,25 +4,47 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from .base import BusyPeriod, Event
+from .base import BusyPeriod, Event, Holiday
 
 log = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# Google's public holiday calendars, picked by the calendar's timezone. Readable with any authenticated token.
+HOLIDAY_CALENDARS = {
+    "Asia/Kolkata": "en.indian#holiday@group.v.calendar.google.com",
+    "Asia/Singapore": "en.singapore#holiday@group.v.calendar.google.com",
+    "Asia/Dubai": "en.ae#holiday@group.v.calendar.google.com",
+    "Europe/London": "en.uk#holiday@group.v.calendar.google.com",
+    "Europe/Berlin": "en.german#holiday@group.v.calendar.google.com",
+    "Europe/Paris": "en.french#holiday@group.v.calendar.google.com",
+    "America/": "en.usa#holiday@group.v.calendar.google.com",
+    "Australia/": "en.australian#holiday@group.v.calendar.google.com",
+}
+
+
+def holiday_calendar_for(tz_name: str) -> str | None:
+    for prefix, cal_id in HOLIDAY_CALENDARS.items():
+        if tz_name == prefix or tz_name.startswith(prefix):
+            return cal_id
+    return None
+
 
 class GoogleCalendar:
-    def __init__(self, creds: Credentials, calendar_id: str = "primary"):
+    def __init__(self, creds: Credentials, calendar_id: str = "primary", holiday_calendar_id: str | None = None):
         self.creds = creds
         self.calendar_id = calendar_id
+        self.holiday_calendar_id = holiday_calendar_id  # None = no holiday awareness
+        self._holiday_cache: tuple[str, float, list[Holiday]] | None = None
         # cache_discovery=False avoids a noisy warning about the file cache in server envs.
         self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)
 
@@ -67,6 +89,34 @@ class GoogleCalendar:
             "summary": cal.get("summary", ""),
             "timezone": cal.get("timeZone", ""),
         }
+
+    def holidays(self, start: datetime, end: datetime) -> list[Holiday]:
+        """Public holidays in the range from Google's regional holiday calendar (observances are skipped)."""
+        if not self.holiday_calendar_id:
+            return []
+        key = f"{start.date()}..{end.date()}"
+        if self._holiday_cache and self._holiday_cache[0] == key and time.time() - self._holiday_cache[1] < 6 * 3600:
+            return self._holiday_cache[2]
+        resp = (
+            self.service.events()
+            .list(
+                calendarId=self.holiday_calendar_id,
+                timeMin=start.astimezone(UTC).isoformat(),
+                timeMax=end.astimezone(UTC).isoformat(),
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=100,
+            )
+            .execute()
+        )
+        found: list[Holiday] = []
+        for item in resp.get("items", []):
+            desc = (item.get("description") or "").lower()
+            day = item.get("start", {}).get("date")
+            if day and ("public holiday" in desc or not desc):
+                found.append(Holiday(date.fromisoformat(day), item.get("summary", "Holiday")))
+        self._holiday_cache = (key, time.time(), found)
+        return found
 
     def busy_periods(self, start: datetime, end: datetime) -> list[BusyPeriod]:
         # events.list (rather than freebusy) so conflicts can be explained by title.

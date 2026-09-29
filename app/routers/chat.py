@@ -107,6 +107,7 @@ async def ws_endpoint(ws: WebSocket):
                         "stt": rt.stt_provider,
                         "sample_rate": rt.settings.tts_sample_rate,
                         "model": rt.llm.model,
+                        "provider": type(rt.llm).__name__.replace("LLM", "").replace("Compatible", "").lower(),
                         "speculation": rt.settings.speculation_enabled,
                     }
                 )

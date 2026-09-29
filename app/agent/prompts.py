@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from app.calendar.base import BusyPeriod
+from app.calendar.base import BusyPeriod, Holiday
 from app.calendar.slots import last_weekday_of_month
 
 SYSTEM_PROMPT = """\
@@ -30,8 +30,9 @@ calendar events named like that before asking.
 listed free block (a 1-hour meeting needs a block of at least 1h). Call find_available_slots only when the snapshot is not \
 enough: buffers, deadlines or anchor events, "not on Wednesday"-style constraints, windows beyond the snapshot, or when \
 you need alternatives because nothing fits. Do not ask for information you can look up yourself. \
-Because the user is waiting on the line, say a short bridging phrase BEFORE every tool call in the same reply \
-("Let me check your calendar." / "One moment, looking that up."), then call the tool.
+Because the user is waiting on the line, say ONE short bridging phrase before the first tool call of a reply \
+("Let me check your calendar." / "One moment, looking that up."), then call the tool; later tool calls in the same \
+reply need no extra phrase.
 3. Offer at most three options, spoken naturally ("I have 2 PM or 4:30 PM on Tuesday, which works?"). \
 Explain briefly if the calendar is busy (e.g. "Tuesday afternoon is taken by Quarterly planning").
 4. If there are no slots, never just say no: use the tool's `alternatives` to propose the closest workable option \
@@ -45,7 +46,11 @@ If the user doesn't provide a title, generate a sensible default based on the co
 After booking, confirm in one sentence. \
 Never say a meeting is booked unless create_event returned "created" in this turn, and when the user picks "the first one", \
 book exactly the first option you offered.
-7. Only call remember_preference when the user explicitly states a lasting preference ("our syncs are usually 30 minutes", "I prefer afternoons"). A duration or time given for the current meeting is NOT a preference.
+7. HOLIDAYS: the snapshot marks public holidays and find_available_slots labels any slot on one with the holiday name. \
+Holidays are still offered, but ALWAYS say which holiday it is when you offer or confirm a time on one \
+("Friday the 2nd is Gandhi Jayanti, a public holiday; I have 10 AM or 11 AM if that still works"). For clearly work \
+meetings you may prefer a working day and say why. Never book on a holiday without having named it.
+8. Only call remember_preference when the user explicitly states a lasting preference ("our syncs are usually 30 minutes", "I prefer afternoons"). A duration or time given for the current meeting is NOT a preference.
 
 # Interpreting time expressions (use the date facts below; all times are in the user's timezone)
 - "morning" = 09:00-12:00, "afternoon" = 12:00-17:00, "evening" = 17:00-21:00, "not too early" = earliest_hour 10 or 11.
@@ -133,6 +138,7 @@ def build_calendar_snapshot(
     work_end: int,
     days: int = 14,
     min_free_minutes: int = 30,
+    holidays: list[Holiday] | None = None,
 ) -> str:
     """Compact per-day view of the next `days` weekdays: busy events (with titles) and precomputed free blocks.
 
@@ -143,11 +149,15 @@ def build_calendar_snapshot(
         f"# Calendar snapshot (next {days} days, working hours {work_start:02d}:00-{work_end:02d}:00, weekends omitted)",
         "Offer only start times that fit entirely inside a listed free block. Busy titles explain conflicts.",
     ]
+    holiday_names = {h.day: h.name for h in holidays or []}
+    if holiday_names:
+        lines[1] += " Days marked HOLIDAY are public holidays: name the holiday whenever you offer a time on one."
     busy_sorted = sorted(((b.start.astimezone(tz), b.end.astimezone(tz), b.title) for b in busy), key=lambda x: x[0])
     for i in range(days):
         day = (now + timedelta(days=i)).date()
         if day.weekday() >= 5:
             continue
+        holiday_tag = f" HOLIDAY ({holiday_names[day]}):" if day in holiday_names else ""
         day_start = datetime.combine(day, time(work_start), tzinfo=tz)
         day_end = datetime.combine(day, time(work_end), tzinfo=tz)
         cursor = max(day_start, now) if i == 0 else day_start
@@ -168,6 +178,7 @@ def build_calendar_snapshot(
             lines.append(f"{day:%a} {day.isoformat()}: working day is over")
             continue
         lines.append(
-            f"{day:%a} {day.isoformat()}: busy {busy_txt if busy_txt else 'none'}; free {', '.join(free) if free else 'none'}"
+            f"{day:%a} {day.isoformat()}:{holiday_tag} busy {busy_txt if busy_txt else 'none'}; "
+            f"free {', '.join(free) if free else 'none'}"
         )
     return "\n".join(lines)

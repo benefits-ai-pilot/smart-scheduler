@@ -9,17 +9,24 @@ meeting, a busy 'tomorrow morning', and recurring 'Weekly Sync' history (usual d
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .base import BusyPeriod, Event
+from .base import BusyPeriod, Event, Holiday
+
+# Real Indian public holidays, so the seeded scenarios (the Friday flight is 2 October) exercise holiday handling.
+SEED_HOLIDAYS = [Holiday(date(2026, 10, 2), "Mahatma Gandhi Jayanti"), Holiday(date(2026, 10, 20), "Dussehra")]
 
 
 class FakeCalendar:
-    def __init__(self, events: list[Event] | None = None):
+    def __init__(self, events: list[Event] | None = None, holidays: list[Holiday] | None = None):
         self.events: list[Event] = list(events or [])
+        self._holidays: list[Holiday] = list(SEED_HOLIDAYS if holidays is None else holidays)
 
     # --- CalendarClient protocol -------------------------------------------------
+    def holidays(self, start: datetime, end: datetime) -> list[Holiday]:
+        return [h for h in self._holidays if start.date() <= h.day <= end.date()]
+
     def busy_periods(self, start: datetime, end: datetime) -> list[BusyPeriod]:
         return [
             BusyPeriod(e.start, e.end, e.title)

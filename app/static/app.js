@@ -131,6 +131,11 @@
           $("ttsmode").textContent = ({ google: "Google Chirp 3 HD voice", deepgram: "Deepgram Aura-2 voice", browser: "Browser voice" })[m.tts_provider] || (m.tts_provider + " voice");
           state.sampleRate = m.sample_rate; state.serverTTS = m.tts === "cloud"; state.speculation = !!m.speculation;
           state.stt = m.stt || "browser";
+          if (m.provider === "gemini") {
+            const n = $("notice"); n.hidden = false; n.className = "notice";
+            n.textContent = `Running on Gemini (${m.model}) free tier: roughly 5 model requests a minute and a small daily cap. ` +
+              "A calendar question uses two requests. If the assistant errors or stops responding, the limit is exhausted: wait a minute and try again.";
+          }
           if (state.stt !== "deepgram" && !rec) { mic.disabled = true; addMsg("error", "This browser has no Web Speech API. Use Chrome, or type below."); }
           else mic.disabled = false;
           $("conn").textContent += m.stt === "deepgram" ? " · Deepgram STT" : " · browser STT"; break;
@@ -148,16 +153,22 @@
           break;
         case "reply_audio_start": state.audioRole = "reply"; break;
         case "token":
+          clearTimeout(state.watchdog);
           if (!state.botEl) state.botEl = addMsg("bot", ""); state.botText += m.text; state.botEl.textContent = state.botText; transcript.scrollTop = transcript.scrollHeight; break;
         case "tool_call": timing.tool = true; addTool(m.name, m.args); break;
         case "tool_result": { const last = transcript.querySelector("details.tool:last-of-type"); if (last) last.querySelector("pre").textContent += "\n→ " + JSON.stringify(m.result, null, 1); break; }
         case "turn_end":
+          clearTimeout(state.watchdog);
           state.listenAfter = m.listen_after !== false;  // false after a booking: the goal is reached, keep the mic closed
           if (state.botEl) state.botEl.textContent = m.text || state.botText;
           if (!state.serverTTS) { state.speaking = true; speakBrowser(m.text); } break;
         case "audio_end": if (state.serverTTS && !sources.length) onSpeechDone(); break;
         case "tts_error": if (!state.speaking) speakBrowser(state.botText); break;
-        case "error": addMsg("error", m.message); onSpeechDone(); break;
+        case "error":
+          clearTimeout(state.watchdog);
+          addMsg("error", m.message);
+          if (m.code === "rate_limit" || m.code === "unavailable") { const n = $("notice"); if (!n.hidden) n.className = "notice warn"; }
+          onSpeechDone(); break;
       }
     };
   };
@@ -169,6 +180,10 @@
     state.speaking = false; mic.classList.remove("speaking");
     addMsg("user", text); state.botEl = null; state.botText = ""; state.audioRole = "reply"; state.lastPartial = ""; clearTimeout(state.partialTimer);
     resetTiming(sentAt); state.speechEndAt = 0;
+    clearTimeout(state.watchdog);
+    state.watchdog = setTimeout(() => {
+      if (!state.botText) addMsg("error", "No response from the model after 20 s. On the Gemini free tier this usually means the rate limit is exhausted; wait a minute and try again.");
+    }, 20000);
     ensureCtx(); if (send) state.ws.send(JSON.stringify({ type: "user_text", text }));
   };
   const sendText = (text) => {

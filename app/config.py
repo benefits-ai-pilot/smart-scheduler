@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     calendar_creds_json: str = ""
     calendar_creds_file: str = "token.json"
     google_calendar_id: str = "primary"
+    holiday_calendar_id: str = (
+        "auto"  # auto = Google's regional holiday calendar for the timezone; none = off; or a calendar id
+    )
     # "Sign in with Google" for visitors: an OAuth client JSON (Desktop client works for localhost,
     # a Web client with the callback URL registered is needed for a public deployment).
     google_oauth_client_json: str = ""

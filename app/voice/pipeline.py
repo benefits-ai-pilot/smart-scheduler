@@ -33,6 +33,25 @@ IDLE_FLUSH_S = 0.3  # tokens paused this long -> speak the clause we have rather
 Sender = Callable[[Any], Awaitable[None]]  # sends a dict (JSON) or bytes (audio) to the client
 
 
+def describe_error(exc: Exception) -> dict:
+    """Turn a provider exception into something a user can act on (free-tier limits are the common case)."""
+    text = f"{type(exc).__name__}: {exc}"
+    lowered = text.lower()
+    if "429" in lowered or "resource_exhausted" in lowered or "quota" in lowered or "rate limit" in lowered:
+        return {
+            "code": "rate_limit",
+            "message": "The model's rate limit is exhausted (free tier). Wait a minute and try again; if it persists, the daily cap is reached.",
+            "detail": text[:300],
+        }
+    if "503" in lowered or "unavailable" in lowered or "high demand" in lowered or "overloaded" in lowered:
+        return {
+            "code": "unavailable",
+            "message": "The model is temporarily unavailable (capacity). Try again in a moment.",
+            "detail": text[:300],
+        }
+    return {"code": "error", "message": text[:300]}
+
+
 def normalise(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
 
@@ -154,7 +173,7 @@ class Turn:
             raise
         except Exception as exc:
             log.exception("turn failed")
-            await self._emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+            await self._emit({"type": "error", **describe_error(exc)})
         finally:
             sentences.put_nowait(None)
         await speaker

@@ -59,7 +59,7 @@ uv run scripts/run_scenarios.py
 
 ### 4. Deploy
 
-**Render (free, no card):** push to GitHub, create a Blueprint from `render.yaml`, and add the secrets `ANTHROPIC_API_KEY` (or your Gemini key), `CALENDAR_CREDS_JSON` (the one-line JSON printed by the authorize script) and `DEEPGRAM_API_KEY`. Free instances sleep after 15 idle minutes; a free uptime pinger on `/health` keeps one awake.
+**Render:** push to GitHub, create a Blueprint from `render.yaml`, and add the secrets `ANTHROPIC_API_KEY` (or your Gemini key), `CALENDAR_CREDS_JSON` (the one-line JSON printed by the authorize script) and `DEEPGRAM_API_KEY`.
 
 **Cloud Run (needs a billing account, stays in the free tier):**
 
@@ -82,6 +82,7 @@ Use a US region: the model APIs are served from the US, so each model call saves
 | `TTS_PROVIDER` | `auto` | `deepgram` (free credit, no card), `google` (needs billing), `browser` |
 | `ACK_ENABLED` | `true` | Play a cached "Okay." the instant the user stops talking |
 | `SPECULATION_ENABLED` | `false` | Start the model on the interim transcript. Doubles model calls on a miss; keep off on free tiers |
+| `HOLIDAY_CALENDAR_ID` | `auto` | Google's public holiday calendar for the timezone (`none` to disable, or a calendar id) |
 | `WORK_DAY_START` / `WORK_DAY_END` | `9` / `18` | Working hours for slot search |
 | `DEFAULT_TIMEZONE` | `Asia/Kolkata` | Used when the browser sends none |
 
@@ -98,7 +99,7 @@ Web Audio playback       ◀── tokens, PCM ───  sentence chunker → T
 
 **Agent loop** ([`app/agent/agent.py`](app/agent/agent.py)). Each turn streams a model response with function calling. Text is forwarded as it arrives; tool calls are executed, their results appended to the history, and the model is called again, up to four rounds. The loop is provider-neutral: [`llm_claude.py`](app/agent/llm_claude.py), [`llm_gemini.py`](app/agent/llm_gemini.py) and [`llm_openai.py`](app/agent/llm_openai.py) implement the same three-method interface.
 
-**Tools** ([`app/agent/tools.py`](app/agent/tools.py)). Four of them: `find_available_slots`, `find_events`, `create_event`, `remember_preference`. The slot search is pure Python ([`calendar/slots.py`](app/calendar/slots.py)) and, when nothing fits, returns alternatives (following days at the same time, the same day outside the preferred hours, a shorter meeting) so the agent can offer a way out instead of failing. `before_event` / `after_event` parameters let "before my flight" or "two days after the kick-off" be a single call. `create_event` rejects overlaps.
+**Tools** ([`app/agent/tools.py`](app/agent/tools.py)). Four of them: `find_available_slots`, `find_events`, `create_event`, `remember_preference`. The slot search is pure Python ([`calendar/slots.py`](app/calendar/slots.py)) and, when nothing fits, returns alternatives (following days at the same time, the same day outside the preferred hours, a shorter meeting) so the agent can offer a way out instead of failing. `before_event` / `after_event` parameters let "before my flight" or "two days after the kick-off" be a single call. Public holidays (from Google's regional holiday calendar) are still offered, but every slot on one carries the holiday's name and the agent says it when offering or booking. `create_event` rejects overlaps.
 
 **Prompt** ([`app/agent/prompts.py`](app/agent/prompts.py)). The model does the language; Python does the dates. Every turn the system prompt gets a date sheet (today, the next 14 dates by weekday, this and next week's ranges, the last weekday of the month) and a calendar snapshot with the next two weeks' events and precomputed free blocks. Plain requests like "Tuesday afternoon" are answered from the snapshot without a tool call; the tools handle buffers, deadlines, exclusions and alternatives. The prompt also carries the conversation policy: collect duration and a time window before searching, one question at a time, at most three options, confirm before booking, keep earlier constraints when the user changes one.
 
@@ -141,6 +142,7 @@ Everything below exists to make the conversation feel fast and to keep model cal
 - **Dates done in Python.** Today's date, the next 14 dates by weekday, "next week", "late next week" and the last weekday of the month are written into the prompt, so the model never counts days itself.
 - **Alternatives when nothing fits.** The slot search returns fallbacks (same time on later days, same day outside preferred hours, a shorter meeting), so the agent can offer a way out instead of saying no.
 - **No double bookings.** `create_event` refuses a time that overlaps an existing event, even if the model picked it from the snapshot.
+- **Holiday aware.** Public holidays are marked in the calendar snapshot and labelled on search results, so whenever the agent offers or books a time on one it says which holiday it is. They're only excluded when the model judges the meeting is clearly work and says so.
 
 ## Limitations
 

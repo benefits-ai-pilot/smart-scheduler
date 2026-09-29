@@ -7,7 +7,7 @@ when nothing fits, proposes alternatives so the agent can resolve conflicts grac
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from .base import BusyPeriod
 
@@ -21,6 +21,7 @@ class SlotQuery:
     latest_hour: float = 18.0  # slot must end by this hour
     exclude_weekdays: set[int] = field(default_factory=set)  # 0=Mon .. 6=Sun
     include_weekends: bool = False
+    exclude_dates: set[date] = field(default_factory=set)  # e.g. public holidays
     buffer_minutes: int = 0  # required gap between a slot and neighbouring events
     step_minutes: int = 30
     max_results: int = 3
@@ -101,7 +102,11 @@ def find_free_slots(busy: list[BusyPeriod], query: SlotQuery, now: datetime | No
     last_day = query.window_end.astimezone(tz).date()
     while day <= last_day and len(slots) < query.max_results:
         weekday = day.weekday()
-        skip = weekday in query.exclude_weekdays or (weekday >= 5 and not query.include_weekends)
+        skip = (
+            weekday in query.exclude_weekdays
+            or (weekday >= 5 and not query.include_weekends)
+            or day in query.exclude_dates
+        )
         if not skip:
             day_start = datetime.combine(day, _hour_to_time(query.earliest_hour), tzinfo=tz)
             day_end = datetime.combine(day, _hour_to_time(query.latest_hour), tzinfo=tz)

@@ -50,6 +50,10 @@ TOOL_SPECS = [
                     "description": "Required free gap before and after neighbouring events",
                 },
                 "max_results": {"type": "integer", "description": "Max slots to return (default 3)"},
+                "exclude_holidays": {
+                    "type": "boolean",
+                    "description": "Skip public holidays. Default false: holidays are searched and each slot on one is labelled with the holiday name.",
+                },
                 "before_event": {
                     "type": "string",
                     "description": "Keyword of a calendar event that the meeting must END before (e.g. 'flight'). The tool finds it and clips the window.",
@@ -68,7 +72,10 @@ TOOL_SPECS = [
     ),
     ToolSpec(
         name="find_events",
-        description="List the user's calendar events in a time range, optionally filtered by a keyword in the title.",
+        description=(
+            "List the user's calendar events in a time range, optionally filtered by a keyword in the title. "
+            "Not needed to anchor a search: use find_available_slots with before_event / after_event instead."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -188,6 +195,9 @@ class ToolRunner:
             max_results=int(a.get("max_results") or 3),
         )
         busy = self.calendar.busy_periods(start - timedelta(days=1), end + timedelta(days=7))
+        holidays = self.calendar.holidays(start, end + timedelta(days=7))
+        if a.get("exclude_holidays"):
+            query.exclude_dates = {h.day for h in holidays}
         slots = find_free_slots(busy, query, now)
         result: dict = {
             "slots": [s.to_dict() for s in slots],
@@ -197,11 +207,26 @@ class ToolRunner:
                 if b.end > start and b.start < end
             ][:12],
         }
+        holiday_names = {h.day: h.name for h in holidays}
+        for slot, dict_ in zip(slots, result["slots"], strict=True):
+            if slot.start.date() in holiday_names:
+                dict_["holiday"] = holiday_names[slot.start.date()]  # say the name when offering this slot
+        in_window = [h for h in holidays if start.date() <= h.day <= end.date()]
+        if in_window:
+            result["holidays_in_window"] = [h.to_dict() for h in in_window]
         if anchors:
             result.update(anchors)
         if not slots:
             result["alternatives"] = find_alternatives(busy, query, now)
             result["note"] = "No slot satisfies all constraints. Offer the closest alternative and ask the user."
+            if a.get("exclude_holidays") and in_window:
+                result["note"] += " Public holidays were excluded at your request: " + ", ".join(
+                    f"{h.day.isoformat()} ({h.name})" for h in in_window
+                )
+        elif any("holiday" in d for d in result["slots"]):
+            result["note"] = (
+                "Some slots fall on a public holiday (see each slot's `holiday`); mention the holiday by name when offering them."
+            )
         self.session.last_offered_slots = result["slots"]
         return result
 
@@ -230,7 +255,11 @@ class ToolRunner:
         ev = self.calendar.create_event(a["title"], start, end, a.get("description", ""))
         self.session.booked.append(ev.to_dict())
         self.session.snapshot_at = 0.0  # the snapshot in the prompt is now stale
-        return {"created": ev.to_dict()}
+        result = {"created": ev.to_dict()}
+        holiday = next((h for h in self.calendar.holidays(start, end) if h.day == start.date()), None)
+        if holiday:
+            result["holiday"] = holiday.name  # relayed to the user in the confirmation
+        return result
 
     def _remember_preference(self, a: dict, now: datetime) -> dict:
         self.session.remember(str(a["key"]), str(a["value"]))

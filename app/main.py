@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from app.agent.agent import Agent
 from app.agent.llm import build_llm
 from app.agent.session import Session
-from app.calendar.google_calendar import GoogleCalendar
+from app.calendar.google_calendar import GoogleCalendar, holiday_calendar_for
 from app.config import Settings, get_settings
 from app.routers import calendar, chat
 from app.voice.pipeline import ACK_PHRASES
@@ -48,6 +48,7 @@ class Runtime:
             )
             if self.calendar is not None:
                 self.calendar_source = "env" if settings.calendar_creds_json.strip() else "file"
+                self.calendar.holiday_calendar_id = self.holiday_calendar(settings.default_timezone)
         except Exception as exc:
             log.warning("Stored calendar token is unusable (%s); connect one from the UI", exc)
         if self.calendar is None:
@@ -87,10 +88,17 @@ class Runtime:
             "oauth_available": self.oauth_client_config() is not None,
         }
 
+    def holiday_calendar(self, tz_name: str) -> str | None:
+        setting = self.settings.holiday_calendar_id.strip()
+        if setting.lower() in ("", "none", "off"):
+            return None
+        return holiday_calendar_for(tz_name) if setting.lower() == "auto" else setting
+
     async def connect_user_calendar(self, uid: str, raw_token_json: str) -> dict:
         """Validate a token against Google and attach that calendar to this browser."""
         calendar = GoogleCalendar.from_json(raw_token_json, self.settings.google_calendar_id)
         info = await asyncio.to_thread(calendar.probe)  # raises if Google rejects the token
+        calendar.holiday_calendar_id = self.holiday_calendar(info.get("timezone") or self.settings.default_timezone)
         self.user_calendars[uid] = (calendar, info)
         self._drop_sessions_for(uid)
         log.info("calendar connected for a visitor: %s", info.get("summary") or info.get("id"))
