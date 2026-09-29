@@ -1,0 +1,239 @@
+"""Per-connection voice pipeline: acknowledgement, speculative turns, streaming text + TTS.
+
+Latency tricks used by production voice agents, applied here:
+- ack:          a cached "Okay." is sent the instant the final transcript arrives (~0 ms of model time).
+- speculation:  the model starts on the interim transcript; output is buffered and released ("committed")
+                when the final transcript matches, otherwise the run is cancelled. Side-effecting tools
+                (booking, remembering) wait behind the commit gate, so a cancelled guess never books anything.
+- streaming:    text deltas go out as they arrive, sentences go to TTS as soon as they are complete, and the
+                bridging sentence before a tool call is flushed to TTS immediately.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+import secrets
+import time
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from app.agent.agent import Agent
+
+from .chunker import SentenceChunker
+from .tts import TTS, queue_iter
+
+log = logging.getLogger(__name__)
+
+ACK_PHRASES = ["Okay.", "Sure.", "Mm-hm."]
+MIN_SPECULATION_WORDS = 2
+IDLE_FLUSH_S = 0.3  # tokens paused this long -> speak the clause we have rather than wait for the sentence
+
+Sender = Callable[[Any], Awaitable[None]]  # sends a dict (JSON) or bytes (audio) to the client
+
+
+def normalise(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+
+
+class Turn:
+    """One agent turn. Speculative turns buffer their output until committed."""
+
+    def __init__(self, pipeline: VoicePipeline, agent: Agent, text: str, speculative: bool):
+        self.pipeline = pipeline
+        self.agent = agent
+        self.text = text
+        self.speculative = speculative
+        self.committed = not speculative
+        self.buffer: list[Any] = []
+        self.gate = asyncio.Event()
+        if not speculative:
+            self.gate.set()
+        self.task = asyncio.create_task(self._run())
+
+    @property
+    def done(self) -> bool:
+        return self.task.done()
+
+    def cancel(self) -> None:
+        self.task.cancel()
+
+    async def commit(self) -> None:
+        """Release buffered output in order, then let further output flow live."""
+        async with self.pipeline.lock:
+            self.committed = True
+            buffered, self.buffer = self.buffer, []
+            for msg in buffered:
+                await self.pipeline.raw_send(msg)
+        self.gate.set()
+
+    async def _emit(self, msg: Any) -> None:
+        if self.committed:
+            await self.pipeline.send(msg)
+        else:
+            self.buffer.append(msg)
+
+    async def _run(self) -> None:
+        sentences: asyncio.Queue[str | None] = asyncio.Queue()
+        chunker = SentenceChunker()
+        tts = self.pipeline.tts
+
+        async def speak() -> None:
+            if tts is None:
+                return
+            try:
+                first = True
+                async for audio in tts.synthesize_stream(queue_iter(sentences)):
+                    if first:
+                        await self._emit({"type": "reply_audio_start"})
+                        first = False
+                    await self._emit(audio)
+            except Exception as exc:
+                log.warning("TTS stream failed: %s", exc)
+                await self._emit({"type": "tts_error", "message": str(exc)})
+
+        speaker = asyncio.create_task(speak())
+        t0 = time.perf_counter()
+        # The agent generator runs in its own task and feeds a queue, so the consumer below can wait with a
+        # timeout (an idle flush) without cancelling the generator mid-step.
+        events: asyncio.Queue[Any] = asyncio.Queue()
+
+        async def produce() -> None:
+            try:
+                async for ev in self.agent.run_turn(self.text):
+                    events.put_nowait(ev)
+            except Exception as exc:  # surfaced to the client by the consumer
+                events.put_nowait(exc)
+            finally:
+                events.put_nowait(None)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(events.get(), IDLE_FLUSH_S)
+                except TimeoutError:
+                    for s in chunker.idle_flush():
+                        sentences.put_nowait(s)
+                    continue
+                if ev is None:
+                    break
+                if isinstance(ev, Exception):
+                    raise ev
+                if ev.type == "text":
+                    await self._emit({"type": "token", "text": ev.data})
+                    for s in chunker.feed(ev.data):
+                        sentences.put_nowait(s)
+                elif ev.type == "tool_call":
+                    for s in chunker.flush():  # say "Let me check..." while the tool runs
+                        sentences.put_nowait(s)
+                    await self._emit({"type": "tool_call", **ev.data})
+                elif ev.type == "tool_result":
+                    await self._emit({"type": "tool_result", **ev.data})
+                elif ev.type == "done":
+                    for s in chunker.flush():
+                        sentences.put_nowait(s)
+                    await self._emit(
+                        {
+                            "type": "turn_end",
+                            "text": ev.data,
+                            "llm_ms": int((time.perf_counter() - t0) * 1000),
+                            "speculative": self.speculative,
+                        }
+                    )
+        except asyncio.CancelledError:
+            producer.cancel()
+            speaker.cancel()
+            raise
+        except Exception as exc:
+            log.exception("turn failed")
+            await self._emit({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        finally:
+            sentences.put_nowait(None)
+        await speaker
+        await self._emit({"type": "audio_end"})
+
+
+class VoicePipeline:
+    def __init__(
+        self,
+        raw_send: Sender,
+        agent: Agent,
+        tts: TTS | None,
+        ack_audio: dict[str, bytes],
+        ack_enabled: bool = True,
+        speculation_enabled: bool = True,
+    ):
+        self.raw_send = raw_send
+        self.agent = agent
+        self.tts = tts
+        self.ack_audio = ack_audio
+        self.ack_enabled = ack_enabled
+        self.speculation_enabled = speculation_enabled
+        self.lock = asyncio.Lock()
+        self.current: Turn | None = None
+        # Speculation instrumentation: how often the guess is used, discarded, or replaced by a newer partial.
+        self.stats = {"started": 0, "hit": 0, "miss": 0, "cancelled": 0, "ack_skipped": 0}
+
+    async def send(self, msg: Any) -> None:
+        async with self.lock:
+            await self.raw_send(msg)
+
+    async def on_partial(self, text: str) -> None:
+        """Interim transcript: start (or keep) a speculative turn for it."""
+        if not self.speculation_enabled or len(text.split()) < MIN_SPECULATION_WORDS:
+            return
+        if self.current and self.current.speculative and normalise(self.current.text) == normalise(text):
+            return
+        if self.current and self.current.speculative and not self.current.committed:
+            self.stats["cancelled"] += 1  # a newer partial replaced a guess still in flight
+        self._cancel_current()
+        self.stats["started"] += 1
+        self.current = Turn(self, self.agent.fork(asyncio.Event()), text, speculative=True)
+        self.current.agent.tools.commit_gate = self.current.gate
+
+    async def on_final(self, text: str) -> None:
+        """Final transcript: commit a matching guess, otherwise acknowledge instantly and start a live turn."""
+        cur = self.current
+        if cur and cur.speculative and not cur.committed and normalise(cur.text) == normalise(text):
+            self.stats["hit"] += 1
+            if cur.buffer:
+                self.stats["ack_skipped"] += 1  # the real reply is already waiting; an "Okay." would only delay it
+            else:
+                await self._ack()
+            self.agent = cur.agent  # the speculative session becomes the real one
+            await cur.commit()
+            await self._send_stats()
+            return
+        if cur and cur.speculative and not cur.committed:
+            self.stats["miss"] += 1
+        await self._ack()
+        self._cancel_current()
+        self.current = Turn(self, self.agent, text, speculative=False)
+        if self.speculation_enabled:
+            await self._send_stats()
+
+    async def _send_stats(self) -> None:
+        await self.send({"type": "speculation", **self.stats})
+
+    def on_cancel(self) -> None:
+        self._cancel_current()
+
+    def close(self) -> None:
+        self._cancel_current()
+        if self.stats["started"]:
+            log.info("speculation stats for this connection: %s", self.stats)
+
+    def _cancel_current(self) -> None:
+        if self.current and not self.current.done:
+            self.current.cancel()
+        self.current = None
+
+    async def _ack(self) -> None:
+        if not self.ack_enabled:
+            return
+        phrase = secrets.choice(ACK_PHRASES)
+        await self.send({"type": "ack", "text": phrase, "audio": phrase in self.ack_audio})
+        if phrase in self.ack_audio:
+            await self.send(self.ack_audio[phrase])

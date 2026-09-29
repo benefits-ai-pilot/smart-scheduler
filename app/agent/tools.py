@@ -1,0 +1,243 @@
+"""Tool declarations exposed to Gemini and their handlers.
+
+Handlers are thin: validate/normalise arguments, call the calendar, shape the result.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta
+
+from app.calendar.base import CalendarClient
+from app.calendar.slots import SlotQuery, find_alternatives, find_free_slots
+
+from .llm import ToolSpec
+from .session import Session
+
+log = logging.getLogger(__name__)
+
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+_ISO = {"type": "string", "description": "ISO 8601 datetime with offset, e.g. 2026-09-29T13:00:00+05:30"}
+
+TOOL_SPECS = [
+    ToolSpec(
+        name="find_available_slots",
+        description=(
+            "Find free meeting slots on the user's calendar within a time window. Returns up to max_results slots, "
+            "the busy events in the window (to explain conflicts), and `alternatives` when nothing fits."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "window_start": _ISO,
+                "window_end": _ISO,
+                "duration_minutes": {"type": "integer", "description": "Meeting length in minutes"},
+                "earliest_hour": {
+                    "type": "number",
+                    "description": "Earliest start hour, 24h (9.5 = 09:30). Default: working-day start",
+                },
+                "latest_hour": {"type": "number", "description": "Latest end hour, 24h. Default: working-day end"},
+                "exclude_weekdays": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Weekdays to skip, e.g. ['wed']",
+                },
+                "include_weekends": {"type": "boolean", "description": "Allow Saturday/Sunday. Default false"},
+                "buffer_minutes": {
+                    "type": "integer",
+                    "description": "Required free gap before and after neighbouring events",
+                },
+                "max_results": {"type": "integer", "description": "Max slots to return (default 3)"},
+                "before_event": {
+                    "type": "string",
+                    "description": "Keyword of a calendar event that the meeting must END before (e.g. 'flight'). The tool finds it and clips the window.",
+                },
+                "after_event": {
+                    "type": "string",
+                    "description": "Keyword of a calendar event that the meeting must come AFTER (e.g. 'Project Alpha Kick-off').",
+                },
+                "after_event_days": {
+                    "type": "integer",
+                    "description": "With after_event: search only this many days following the event's day (default 2).",
+                },
+            },
+            "required": ["window_start", "window_end", "duration_minutes"],
+        },
+    ),
+    ToolSpec(
+        name="find_events",
+        description="List the user's calendar events in a time range, optionally filtered by a keyword in the title.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "time_min": _ISO,
+                "time_max": _ISO,
+                "query": {
+                    "type": "string",
+                    "description": "Keyword(s) to match in the event title, e.g. 'Project Alpha'",
+                },
+            },
+            "required": ["time_min", "time_max"],
+        },
+    ),
+    ToolSpec(
+        name="create_event",
+        description="Book a meeting on the user's calendar. Call only after the user confirmed the exact slot.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start": _ISO,
+                "end": _ISO,
+                "description": {"type": "string"},
+            },
+            "required": ["title", "start", "end"],
+        },
+    ),
+    ToolSpec(
+        name="remember_preference",
+        description="Store a lasting user preference, e.g. usual_meeting_minutes=30 or preferred_earliest_hour=10.",
+        input_schema={
+            "type": "object",
+            "properties": {"key": {"type": "string"}, "value": {"type": "string"}},
+            "required": ["key", "value"],
+        },
+    ),
+]
+
+
+SIDE_EFFECT_TOOLS = {"create_event", "remember_preference"}
+
+
+class ToolRunner:
+    def __init__(
+        self,
+        calendar: CalendarClient,
+        session: Session,
+        work_start: int,
+        work_end: int,
+        step_minutes: int = 30,
+        commit_gate: asyncio.Event | None = None,
+    ):
+        self.calendar = calendar
+        self.session = session
+        self.work_start = work_start
+        self.work_end = work_end
+        self.step_minutes = step_minutes
+        # A speculative turn (started on an interim transcript) may read the calendar freely but must not
+        # book or remember anything until the transcript is confirmed and the turn is committed.
+        self.commit_gate = commit_gate
+
+    async def dispatch(self, name: str, args: dict, now: datetime) -> dict:
+        handler = getattr(self, f"_{name}", None)
+        if handler is None:
+            return {"error": f"unknown tool {name}"}
+        if name in SIDE_EFFECT_TOOLS and self.commit_gate is not None:
+            await self.commit_gate.wait()
+        try:
+            return await asyncio.to_thread(handler, args, now)
+        except Exception as exc:  # surface tool errors to the model instead of crashing the turn
+            log.exception("tool %s failed", name)
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    # --- handlers (sync; run in a worker thread) ---------------------------------
+    def _find_available_slots(self, a: dict, now: datetime) -> dict:
+        start, end = self._dt(a["window_start"]), self._dt(a["window_end"])
+        if end <= start:
+            return {"error": "window_end must be after window_start"}
+        anchors: dict = {}
+        if a.get("before_event"):
+            ev = self._find_anchor(a["before_event"], start, end + timedelta(days=14))
+            if ev is None:
+                return {"error": f"no event matching {a['before_event']!r} found in the window", "slots": []}
+            anchors["before_event"] = ev.to_dict()
+            end = min(end, ev.start) if ev.start > start else ev.start
+            start = min(start, end - timedelta(days=1)) if end <= start else start
+        if a.get("after_event"):
+            ev = self._find_anchor(a["after_event"], start - timedelta(days=14), end)
+            if ev is None:
+                return {"error": f"no event matching {a['after_event']!r} found in the window", "slots": []}
+            anchors["after_event"] = ev.to_dict()
+            # "a day or two after X" means the days following X's day, not the same afternoon.
+            days_after = int(a.get("after_event_days") or 2)
+            next_day = (ev.end + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            start = max(start, next_day)
+            end = min(end, (next_day + timedelta(days=days_after - 1)).replace(hour=23, minute=59))
+        if end <= start:
+            return {"error": "the anchor event leaves no room in the requested window", "slots": [], **anchors}
+        # Default hour bounds are the working day, but an explicit window inside one day (e.g. 19:00-21:00
+        # for "in the evening") must not be clipped by them.
+        earliest, latest = float(self.work_start), float(self.work_end)
+        if (end - start) <= timedelta(hours=24):
+            earliest = min(earliest, start.hour + start.minute / 60)
+            latest = max(latest, end.hour + end.minute / 60 if (end.hour, end.minute) != (0, 0) else 24.0)
+        query = SlotQuery(
+            window_start=start,
+            window_end=end,
+            duration=timedelta(minutes=int(a["duration_minutes"])),
+            earliest_hour=float(a.get("earliest_hour") or earliest),
+            latest_hour=float(a.get("latest_hour") or latest),
+            exclude_weekdays={
+                WEEKDAYS[d[:3].lower()] for d in a.get("exclude_weekdays") or [] if d[:3].lower() in WEEKDAYS
+            },
+            include_weekends=bool(a.get("include_weekends", False)),
+            buffer_minutes=int(a.get("buffer_minutes") or 0),
+            step_minutes=self.step_minutes,
+            max_results=int(a.get("max_results") or 3),
+        )
+        busy = self.calendar.busy_periods(start - timedelta(days=1), end + timedelta(days=7))
+        slots = find_free_slots(busy, query, now)
+        result: dict = {
+            "slots": [s.to_dict() for s in slots],
+            "busy_in_window": [
+                {"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()}
+                for b in busy
+                if b.end > start and b.start < end
+            ][:12],
+        }
+        if anchors:
+            result.update(anchors)
+        if not slots:
+            result["alternatives"] = find_alternatives(busy, query, now)
+            result["note"] = "No slot satisfies all constraints. Offer the closest alternative and ask the user."
+        self.session.last_offered_slots = result["slots"]
+        return result
+
+    def _find_anchor(self, query: str, start: datetime, end: datetime):
+        events = self.calendar.search_events(start, end, query)
+        return events[0] if events else None
+
+    def _find_events(self, a: dict, now: datetime) -> dict:
+        events = self.calendar.search_events(self._dt(a["time_min"]), self._dt(a["time_max"]), a.get("query") or None)
+        return {"events": [e.to_dict() for e in events[:20]], "count": len(events)}
+
+    def _create_event(self, a: dict, now: datetime) -> dict:
+        start, end = self._dt(a["start"]), self._dt(a["end"])
+        if end <= start:
+            return {"error": "end must be after start"}
+        if start < now:
+            return {"error": "cannot book a meeting in the past"}
+        clash = [b for b in self.calendar.busy_periods(start, end) if b.end > start and b.start < end]
+        if clash:
+            return {
+                "error": "that time conflicts with an existing event",
+                "conflicts": [
+                    {"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()} for b in clash
+                ],
+            }
+        ev = self.calendar.create_event(a["title"], start, end, a.get("description", ""))
+        self.session.booked.append(ev.to_dict())
+        self.session.snapshot_at = 0.0  # the snapshot in the prompt is now stale
+        return {"created": ev.to_dict()}
+
+    def _remember_preference(self, a: dict, now: datetime) -> dict:
+        self.session.remember(str(a["key"]), str(a["value"]))
+        return {"saved": {a["key"]: a["value"]}}
+
+    def _dt(self, value: str) -> datetime:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=self.session.tz)
+        return dt.astimezone(self.session.tz)
