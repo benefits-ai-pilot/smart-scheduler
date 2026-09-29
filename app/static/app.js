@@ -42,10 +42,13 @@
     return performance.now() + (startAt - ac.currentTime) * 1000;  // when this chunk will actually be heard
   };
   const stopAudio = () => { sources.forEach((s) => { try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
+  // Runs once per turn (it can be triggered both by the last audio chunk ending and by the server's audio_end).
   const onSpeechDone = () => {
-    state.speaking = false; mic.classList.remove("speaking"); logTurnTiming();
-    if ($("autolisten").checked && state.listenAfter !== false && !state.listening) startListening();
-    state.listenAfter = true;
+    state.speaking = false; mic.classList.remove("speaking");
+    if (state.turnFinished) return;
+    state.turnFinished = true; logTurnTiming();
+    if (state.listenAfter === false) { stopListening(); return; }  // a booking was made: the goal is reached, keep the mic closed
+    if ($("autolisten").checked && !state.listening) startListening();
   };
 
   // Browser TTS fallback (used when the server has no Cloud TTS credentials).
@@ -160,6 +163,7 @@
         case "turn_end":
           clearTimeout(state.watchdog);
           state.listenAfter = m.listen_after !== false;  // false after a booking: the goal is reached, keep the mic closed
+          if (!state.listenAfter && state.listening) stopListening();  // e.g. the mic was still open while the user typed "book it"
           if (state.botEl) state.botEl.textContent = m.text || state.botText;
           if (!state.serverTTS) { state.speaking = true; speakBrowser(m.text); } break;
         case "audio_end": if (state.serverTTS && !sources.length) onSpeechDone(); break;
@@ -179,7 +183,7 @@
     stopAudio(); if (state.speaking && send) state.ws.send(JSON.stringify({ type: "cancel" }));
     state.speaking = false; mic.classList.remove("speaking");
     addMsg("user", text); state.botEl = null; state.botText = ""; state.audioRole = "reply"; state.lastPartial = ""; clearTimeout(state.partialTimer);
-    resetTiming(sentAt); state.speechEndAt = 0;
+    resetTiming(sentAt); state.speechEndAt = 0; state.turnFinished = false; state.listenAfter = true;
     clearTimeout(state.watchdog);
     state.watchdog = setTimeout(() => {
       if (!state.botText) addMsg("error", "No response from the model after 20 s. On the Gemini free tier this usually means the rate limit is exhausted; wait a minute and try again.");

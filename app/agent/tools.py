@@ -91,7 +91,10 @@ TOOL_SPECS = [
     ),
     ToolSpec(
         name="create_event",
-        description="Book a meeting on the user's calendar. Call only after the user confirmed the exact slot.",
+        description=(
+            "Book a meeting on the user's calendar. Refuses a time that overlaps an existing event unless "
+            "override_conflicts=true, and a public holiday unless confirmed_holiday=true; both only after the user agreed."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -99,6 +102,14 @@ TOOL_SPECS = [
                 "start": _ISO,
                 "end": _ISO,
                 "description": {"type": "string"},
+                "override_conflicts": {
+                    "type": "boolean",
+                    "description": "Book even though it overlaps an existing event (the existing event is kept). Only when the user asked for that.",
+                },
+                "confirmed_holiday": {
+                    "type": "boolean",
+                    "description": "The user was told the day is a public holiday and still wants it.",
+                },
             },
             "required": ["title", "start", "end"],
         },
@@ -245,20 +256,31 @@ class ToolRunner:
         if start < now:
             return {"error": "cannot book a meeting in the past"}
         clash = [b for b in self.calendar.busy_periods(start, end) if b.end > start and b.start < end]
-        if clash:
+        conflicts = [{"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()} for b in clash]
+        if clash and not a.get("override_conflicts"):
             return {
                 "error": "that time conflicts with an existing event",
-                "conflicts": [
-                    {"title": b.title, "start": b.start.isoformat(), "end": b.end.isoformat()} for b in clash
-                ],
+                "conflicts": conflicts,
+                "note": (
+                    "Tell the user what is there and offer other times. Suggest booking over the existing event only if "
+                    "there are no alternatives; if the user asks to book over it anyway, call again with override_conflicts=true."
+                ),
+            }
+        holiday = next((h for h in self.calendar.holidays(start, end) if h.day == start.date()), None)
+        if holiday and not a.get("confirmed_holiday"):
+            return {
+                "error": f"{start:%A} {start.date().isoformat()} is {holiday.name}, a public holiday",
+                "holiday": holiday.name,
+                "note": "Tell the user and ask; if they still want it, call again with confirmed_holiday=true.",
             }
         ev = self.calendar.create_event(a["title"], start, end, a.get("description", ""))
         self.session.booked.append(ev.to_dict())
         self.session.snapshot_at = 0.0  # the snapshot in the prompt is now stale
         result = {"created": ev.to_dict()}
-        holiday = next((h for h in self.calendar.holidays(start, end) if h.day == start.date()), None)
         if holiday:
             result["holiday"] = holiday.name  # relayed to the user in the confirmation
+        if clash:
+            result["overlaps"] = conflicts  # booked over these at the user's request; they were left in place
         return result
 
     def _remember_preference(self, a: dict, now: datetime) -> dict:

@@ -162,6 +162,9 @@ def _confirmation(results: list[tuple[ToolCall, dict]]) -> str | None:
             )
             if result.get("holiday"):
                 parts.append(f"Just so you know, that day is {result['holiday']}, a public holiday.")
+            if result.get("overlaps"):
+                titles = " and ".join(c["title"] for c in result["overlaps"])
+                parts.append(f"It overlaps {titles}, which I left in place.")
         elif call.name == "remember_preference":
             parts.append("Noted, I'll remember that.")
     return " ".join(parts) if parts else None
