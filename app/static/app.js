@@ -55,7 +55,11 @@
     return performance.now() + (startAt - ac.currentTime) * 1000;  // when this chunk will actually be heard
   };
   const stopAudio = () => { sources.forEach((s) => { try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
-  const onSpeechDone = () => { state.speaking = false; mic.classList.remove("speaking"); finishTurnStats(); if ($("autolisten").checked && !state.listening) startListening(); };
+  const onSpeechDone = () => {
+    state.speaking = false; mic.classList.remove("speaking"); finishTurnStats();
+    if ($("autolisten").checked && state.listenAfter !== false && !state.listening) startListening();
+    state.listenAfter = true;
+  };
 
   // Browser TTS fallback (used when the server has no Cloud TTS credentials).
   const speakBrowser = (text, isAck = false) => {
@@ -144,8 +148,8 @@
           else mic.disabled = false;
           $("conn").textContent += m.stt === "deepgram" ? " · Deepgram STT" : " · browser STT"; break;
         case "transcript":
-          if (!m.final) { interim.textContent = m.text; break; }
-          interim.textContent = "";
+          if (!m.final) { interim.textContent = m.text; armIdleTimer(); break; }  // speech in progress: keep the mic open
+          interim.textContent = ""; clearTimeout(state.idleTimer);
           // The server finished the utterance; the clock starts when the speech actually ended.
           beginTurn(m.text, performance.now() - (m.speech_end_ago_ms || 0), false);
           if (state.listening) { state.listening = false; mic.classList.remove("listening"); stopCapture(); state.ws.send(JSON.stringify({ type: "listen_stop" })); }
@@ -163,6 +167,7 @@
         case "tool_call": state.sawTool = true; addTool(m.name, m.args); break;
         case "tool_result": { state.afterToolResult = true; const last = transcript.querySelector("details.tool:last-of-type"); if (last) last.querySelector("pre").textContent += "\n→ " + JSON.stringify(m.result, null, 1); break; }
         case "turn_end":
+          state.listenAfter = m.listen_after !== false;  // false after a booking: the goal is reached, keep the mic closed
           setLatency("lat-llm", m.llm_ms); if (state.botEl) state.botEl.textContent = m.text || state.botText;
           if (!state.serverTTS) { state.speaking = true; speakBrowser(m.text); } break;
         case "audio_end": if (state.serverTTS && !sources.length) onSpeechDone(); break;
@@ -231,6 +236,9 @@
     rec.onerror = (e) => { if (e.error !== "no-speech" && e.error !== "aborted") addMsg("error", "Speech recognition: " + e.error); };
   }
   const serverSTT = () => state.stt === "deepgram";
+  // Close the mic after this long without speech (server-side STT has no silence limit of its own, and it bills per second).
+  const LISTEN_IDLE_MS = 8000;
+  const armIdleTimer = () => { clearTimeout(state.idleTimer); state.idleTimer = setTimeout(() => { if (state.listening) { interim.textContent = ""; stopListening(); } }, LISTEN_IDLE_MS); };
   const startListening = async () => {
     if (state.listening) return;
     if (!serverSTT() && !rec) return;
@@ -238,10 +246,12 @@
     try {
       if (serverSTT()) await startCapture(); else rec.start();
       state.listening = true; mic.classList.add("listening");
+      if (serverSTT()) armIdleTimer();
     } catch (err) { addMsg("error", "Microphone: " + (err.message || err)); stopCapture(); }
   };
   const stopListening = () => {
     if (!state.listening) return;
+    clearTimeout(state.idleTimer);
     if (serverSTT()) { state.listening = false; mic.classList.remove("listening"); stopCapture(); state.ws?.send(JSON.stringify({ type: "listen_stop" })); }
     else rec.stop();
   };

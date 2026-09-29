@@ -55,7 +55,8 @@ class Settings(BaseSettings):
     tts_voice: str = "en-US-Chirp3-HD-Aoede"
     tts_language: str = "en-US"
     tts_sample_rate: int = 24000
-    ack_enabled: bool = True  # play a cached "Okay." the instant the transcript is final
+    ack_enabled: bool = True  # play a cached "Okay." shortly after the transcript is final
+    ack_delay_ms: int = 500  # a beat before the "Okay." so it sounds like a listener, not a machine; skipped if the reply is ready first
     speculation_enabled: bool = True  # start the model on interim transcripts, commit when the final matches
 
     # Scheduling defaults

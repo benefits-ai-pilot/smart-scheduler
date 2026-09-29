@@ -86,6 +86,7 @@ class Turn:
                 first = True
                 async for audio in tts.synthesize_stream(queue_iter(sentences)):
                     if first:
+                        self.pipeline.cancel_pending_ack()  # the real reply is ready; no "Okay." needed
                         await self._emit({"type": "reply_audio_start"})
                         first = False
                     await self._emit(audio)
@@ -95,6 +96,7 @@ class Turn:
 
         speaker = asyncio.create_task(speak())
         t0 = time.perf_counter()
+        booked_before = len(self.agent.session.booked)
         # The agent generator runs in its own task and feeds a queue, so the consumer below can wait with a
         # timeout (an idle flush) without cancelling the generator mid-step.
         events: asyncio.Queue[Any] = asyncio.Queue()
@@ -134,12 +136,16 @@ class Turn:
                 elif ev.type == "done":
                     for s in chunker.flush():
                         sentences.put_nowait(s)
+                    if tts is None:
+                        self.pipeline.cancel_pending_ack()  # the browser speaks the reply from here
                     await self._emit(
                         {
                             "type": "turn_end",
                             "text": ev.data,
                             "llm_ms": int((time.perf_counter() - t0) * 1000),
                             "speculative": self.speculative,
+                            # After a booking the conversation has reached its goal: do not reopen the mic.
+                            "listen_after": len(self.agent.session.booked) == booked_before,
                         }
                     )
         except asyncio.CancelledError:
@@ -164,15 +170,18 @@ class VoicePipeline:
         ack_audio: dict[str, bytes],
         ack_enabled: bool = True,
         speculation_enabled: bool = True,
+        ack_delay_s: float = 0.5,
     ):
         self.raw_send = raw_send
         self.agent = agent
         self.tts = tts
         self.ack_audio = ack_audio
         self.ack_enabled = ack_enabled
+        self.ack_delay_s = ack_delay_s
         self.speculation_enabled = speculation_enabled
         self.lock = asyncio.Lock()
         self.current: Turn | None = None
+        self._pending_ack: asyncio.Task | None = None
         # Speculation instrumentation: how often the guess is used, discarded, or replaced by a newer partial.
         self.stats = {"started": 0, "hit": 0, "miss": 0, "cancelled": 0, "ack_skipped": 0}
 
@@ -208,8 +217,8 @@ class VoicePipeline:
             return
         if cur and cur.speculative and not cur.committed:
             self.stats["miss"] += 1
+        self._cancel_current()  # before scheduling the ack: cancelling the old turn also clears pending acks
         await self._ack()
-        self._cancel_current()
         self.current = Turn(self, self.agent, text, speculative=False)
         if self.speculation_enabled:
             await self._send_stats()
@@ -226,13 +235,31 @@ class VoicePipeline:
             log.info("speculation stats for this connection: %s", self.stats)
 
     def _cancel_current(self) -> None:
+        self.cancel_pending_ack()
         if self.current and not self.current.done:
             self.current.cancel()
         self.current = None
 
+    def cancel_pending_ack(self) -> None:
+        if self._pending_ack and not self._pending_ack.done():
+            self._pending_ack.cancel()
+        self._pending_ack = None
+
     async def _ack(self) -> None:
+        """Play the acknowledgement after a short beat, unless the reply's audio is ready sooner."""
         if not self.ack_enabled:
             return
+        self.cancel_pending_ack()
+        if self.ack_delay_s <= 0:
+            await self._send_ack()
+            return
+        self._pending_ack = asyncio.create_task(self._delayed_ack())
+
+    async def _delayed_ack(self) -> None:
+        await asyncio.sleep(self.ack_delay_s)
+        await self._send_ack()
+
+    async def _send_ack(self) -> None:
         phrase = secrets.choice(ACK_PHRASES)
         await self.send({"type": "ack", "text": phrase, "audio": phrase in self.ack_audio})
         if phrase in self.ack_audio:

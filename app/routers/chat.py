@@ -88,7 +88,13 @@ async def ws_endpoint(ws: WebSocket):
                         continue
                     raise
                 pipeline = VoicePipeline(
-                    raw_send, agent, rt.tts, rt.ack_audio, rt.settings.ack_enabled, rt.settings.speculation_enabled
+                    raw_send,
+                    agent,
+                    rt.tts,
+                    rt.ack_audio,
+                    rt.settings.ack_enabled,
+                    rt.settings.speculation_enabled,
+                    rt.settings.ack_delay_ms / 1000,
                 )
                 rt.warm_in_background()
                 rt.spawn(agent.refresh_snapshot())  # so the first turn does not wait for the calendar read
