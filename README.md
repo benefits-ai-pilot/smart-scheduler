@@ -1,5 +1,7 @@
 # Smart Scheduler
 
+**Live demo:** https://smart-scheduler-yyfn.onrender.com (Render free tier; the first load can take about a minute while the instance wakes up.)
+
 A voice assistant that finds and books meeting times on Google Calendar through a spoken, multi-turn conversation.
 
 ```
