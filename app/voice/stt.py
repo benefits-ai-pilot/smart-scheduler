@@ -127,7 +127,7 @@ class DeepgramSTT:
             await ws.send(json.dumps({"type": "CloseStream"}))  # Deepgram flushes the last results, then closes
             if self.receiver is not None:
                 await asyncio.wait_for(self.receiver, timeout=3)
-        except (TimeoutError, Exception) as exc:
+        except Exception as exc:
             log.debug("STT stop: %s", exc)
             if self.receiver is not None:
                 self.receiver.cancel()
@@ -151,7 +151,6 @@ class DeepgramSTT:
 
     async def handle_message(self, message: dict) -> None:
         """Route one Deepgram message, holding finals for the grace period so pauses don't split sentences."""
-        events = self.aggregator.handle(message)
         has_words = False
         if message.get("type") == "Results":  # UtteranceEnd carries `channel` as a list, so check the type first
             alt = ((message.get("channel") or {}).get("alternatives") or [{}])[0]
@@ -162,11 +161,8 @@ class DeepgramSTT:
             held, _ = self._pending_final
             self._pending_final = None
             self.aggregator.finals.insert(0, held)
-            events = [
-                (k, " ".join([held, *rest[0:1]]), *rest[1:]) if k == "partial" else (k, *rest) for k, *rest in events
-            ]
-            events = [e if e[0] != "final" else ("final", f"{held} {e[1]}".strip(), e[2]) for e in events]
-        for event in events:
+        # Restore held text before aggregation, so a new final flushes it exactly once.
+        for event in self.aggregator.handle(message):
             if event[0] == "final":
                 self._pending_final = (event[1], event[2])
                 self._cancel_grace()

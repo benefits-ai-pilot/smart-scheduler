@@ -53,12 +53,15 @@ class Agent:
         self.tools = ToolRunner(calendar, session, work_start, work_end, step_minutes, commit_gate)
         self.owner: str | None = None  # browser uid that created this agent (used to drop sessions on calendar swap)
         self._refresh_task: asyncio.Task | None = None
+        self._snapshot_lock = asyncio.Lock()
 
     def fork(self, commit_gate: asyncio.Event) -> Agent:
         """A speculative copy: same LLM/calendar, copied session, side-effect tools held behind the gate."""
-        return Agent(
+        agent = Agent(
             self.llm, self.calendar, self.session.copy(), self.work_start, self.work_end, self.step_minutes, commit_gate
         )
+        agent.owner = self.owner
+        return agent
 
     def refresh_snapshot_in_background(self) -> None:
         """Re-read the calendar without blocking the current turn (stale-while-revalidate)."""
@@ -67,7 +70,7 @@ class Agent:
 
     async def current_snapshot(self, now: datetime) -> str:
         """The snapshot for this turn: a cached one at once (refreshing behind the scenes if stale), or a fresh read
-        only when there is none yet, so a calendar round trip is never on the path to the first token."""
+        only when there is none yet. Initial turns may wait if prefetch has not finished."""
         sess = self.session
         if sess.snapshot:
             if time.time() - sess.snapshot_at >= SNAPSHOT_TTL_S:
@@ -77,6 +80,10 @@ class Agent:
 
     async def refresh_snapshot(self, now: datetime | None = None, force: bool = False) -> str:
         """Read the next two weeks of the calendar into the prompt snapshot (cached for SNAPSHOT_TTL_S)."""
+        async with self._snapshot_lock:
+            return await self._load_snapshot(now, force)
+
+    async def _load_snapshot(self, now: datetime | None, force: bool) -> str:
         sess = self.session
         if not force and sess.snapshot and time.time() - sess.snapshot_at < SNAPSHOT_TTL_S:
             return sess.snapshot
@@ -122,16 +129,26 @@ class Agent:
                     calls.append(ev.call)
                 elif ev.kind == "assistant":
                     self.session.history.append(ev.message)
-            if not calls or _round == MAX_TOOL_ROUNDS:
+            if not calls:
                 break
             results: list[tuple[ToolCall, dict]] = []
             for call in calls:
                 yield AgentEvent("tool_call", {"name": call.name, "args": call.args})
-                result = await self.tools.dispatch(call.name, call.args, now)
+                result = (
+                    {"error": "Tool round limit reached; this call was not executed."}
+                    if _round == MAX_TOOL_ROUNDS
+                    else await self.tools.dispatch(call.name, call.args, now)
+                )
                 yield AgentEvent("tool_result", {"name": call.name, "result": result})
                 results.append((call, result))
             msgs = self.llm.tool_results(results)
             self.session.history.extend(msgs if isinstance(msgs, list) else [msgs])
+            if _round == MAX_TOOL_ROUNDS:
+                reply = "I couldn't finish that search. Could you narrow down the day or time?"
+                full_text += (" " if full_text and not full_text[-1].isspace() else "") + reply
+                yield AgentEvent("text", reply)
+                self.session.history.append(self.llm.assistant_message(reply))
+                break
             if any(c.name == "create_event" and "created" in r for c, r in results):
                 self.refresh_snapshot_in_background()  # so the next turn does not offer the slot just booked
 

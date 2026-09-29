@@ -23,7 +23,10 @@
   const addMsg = (cls, text) => { const el = document.createElement("div"); el.className = "msg " + cls; el.textContent = text; transcript.appendChild(el); transcript.scrollTop = transcript.scrollHeight; return el; };
   const addTool = (name, args) => {
     const el = document.createElement("details"); el.className = "tool";
-    el.innerHTML = `<summary>${name}(${Object.keys(args).join(", ")})</summary><pre>${JSON.stringify(args, null, 1)}</pre>`;
+    const summary = document.createElement("summary"), details = document.createElement("pre");
+    summary.textContent = `${name}(${Object.keys(args).join(", ")})`;
+    details.textContent = JSON.stringify(args, null, 1);
+    el.append(summary, details);
     transcript.appendChild(el); transcript.scrollTop = transcript.scrollHeight; return el;
   };
 
@@ -41,7 +44,7 @@
     sources.push(src); src.onended = () => { sources = sources.filter((s) => s !== src); if (!sources.length && state.audioDone) onSpeechDone(); };
     return performance.now() + (startAt - ac.currentTime) * 1000;  // when this chunk will actually be heard
   };
-  const stopAudio = () => { sources.forEach((s) => { try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
+  const stopAudio = () => { sources.forEach((s) => { s.onended = null; try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
   // Runs once per turn (it can be triggered both by the last audio chunk ending and by the server's audio_end).
   const onSpeechDone = () => {
     state.speaking = false; mic.classList.remove("speaking");
@@ -119,7 +122,14 @@
     const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
     ws.binaryType = "arraybuffer"; state.ws = ws;
     ws.onopen = sendHello;
-    ws.onclose = () => { $("conn").textContent = "disconnected"; $("conn").className = "pill warn"; setTimeout(connect, 1500); };
+    ws.onclose = () => {
+      clearTimeout(state.idleTimer); clearTimeout(state.partialTimer); clearTimeout(state.watchdog);
+      state.listening = false; state.speaking = false;
+      stopCapture(); rec?.abort(); stopAudio();
+      mic.classList.remove("listening", "speaking");
+      $("conn").textContent = "disconnected"; $("conn").className = "pill warn";
+      setTimeout(connect, 1500);
+    };
     ws.onmessage = (ev) => {
       if (ev.data instanceof ArrayBuffer) {
         state.speaking = true; mic.classList.add("speaking");
@@ -134,11 +144,6 @@
           $("ttsmode").textContent = ({ google: "Google Chirp 3 HD voice", deepgram: "Deepgram Aura-2 voice", browser: "Browser voice" })[m.tts_provider] || (m.tts_provider + " voice");
           state.sampleRate = m.sample_rate; state.serverTTS = m.tts === "cloud"; state.speculation = !!m.speculation;
           state.stt = m.stt || "browser";
-          if (m.provider === "gemini") {
-            const n = $("notice"); n.hidden = false; n.className = "notice";
-            n.textContent = `Running on Gemini (${m.model}) free tier: roughly 5 model requests a minute and a small daily cap. ` +
-              "A calendar question uses two requests. If the assistant errors or stops responding, the limit is exhausted: wait a minute and try again.";
-          }
           if (state.stt !== "deepgram" && !rec) { mic.disabled = true; addMsg("error", "This browser has no Web Speech API. Use Chrome, or type below."); }
           else mic.disabled = false;
           $("conn").textContent += m.stt === "deepgram" ? " · Deepgram STT" : " · browser STT"; break;
@@ -175,7 +180,6 @@
         case "error":
           clearTimeout(state.watchdog);
           addMsg("error", m.message);
-          if (m.code === "rate_limit" || m.code === "unavailable") { const n = $("notice"); if (!n.hidden) n.className = "notice warn"; }
           onSpeechDone(); break;
       }
     };
@@ -190,7 +194,7 @@
     resetTiming(sentAt); state.speechEndAt = 0; state.turnFinished = false; state.listenAfter = true; state.audioDone = false;
     clearTimeout(state.watchdog);
     state.watchdog = setTimeout(() => {
-      if (!state.botText) addMsg("error", "No response from the model after 20 s. On the Gemini free tier this usually means the rate limit is exhausted; wait a minute and try again.");
+      if (!state.botText) addMsg("error", "The response is taking longer than expected. You can wait or try again.");
     }, 20000);
     ensureCtx(); if (send) state.ws.send(JSON.stringify({ type: "user_text", text }));
   };
@@ -246,19 +250,22 @@
   const LISTEN_IDLE_MS = 8000;
   const armIdleTimer = () => { clearTimeout(state.idleTimer); state.idleTimer = setTimeout(() => { if (state.listening) { interim.textContent = ""; stopListening(); } }, LISTEN_IDLE_MS); };
   const startListening = async () => {
-    if (state.listening) return;
+    if (state.listening || state.startingCapture || state.ws?.readyState !== 1) return;
     if (!serverSTT() && !rec) return;
+    state.ws.send(JSON.stringify({ type: "cancel" }));
     stopAudio(); state.speaking = false; mic.classList.remove("speaking"); ensureCtx();
+    state.startingCapture = true;
     try {
       if (serverSTT()) await startCapture(); else rec.start();
       state.listening = true; mic.classList.add("listening");
       if (serverSTT()) armIdleTimer();
     } catch (err) { addMsg("error", "Microphone: " + (err.message || err)); stopCapture(); }
+    finally { state.startingCapture = false; }
   };
   const stopListening = () => {
     if (!state.listening) return;
     clearTimeout(state.idleTimer);
-    if (serverSTT()) { state.listening = false; mic.classList.remove("listening"); stopCapture(); state.ws?.send(JSON.stringify({ type: "listen_stop" })); }
+    if (serverSTT()) { state.listening = false; mic.classList.remove("listening"); stopCapture(); if (state.ws?.readyState === 1) state.ws.send(JSON.stringify({ type: "listen_stop" })); }
     else rec.stop();
   };
   mic.addEventListener("click", () => (state.listening ? stopListening() : startListening()));

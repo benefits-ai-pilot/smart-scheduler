@@ -23,7 +23,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-CACHE_SENTENCES = 200  # ~1 s of 24 kHz PCM is 48 KB; 200 entries stay under 10 MB
+CACHE_SENTENCES = 200
+CACHE_BYTES = 10 * 1024 * 1024  # cap actual audio size, not an assumed sentence duration
 KEEPALIVE = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=600.0)
 
 
@@ -109,6 +110,7 @@ class DeepgramTTS:
         self.voice = voice
         self.sample_rate = sample_rate
         self._cache: OrderedDict[str, bytes] = OrderedDict()
+        self._cache_bytes = 0
 
     @property
     def _params(self) -> dict:
@@ -139,12 +141,22 @@ class DeepgramTTS:
             yield cached
             return
         parts: list[bytes] = []
+        size = 0
         async for chunk in self._speak(text):
-            parts.append(chunk)
+            size += len(chunk)
+            if size <= CACHE_BYTES:
+                parts.append(chunk)
+            else:
+                parts.clear()
             yield chunk
+        if not size or size > CACHE_BYTES:
+            return
+        previous = self._cache.pop(key, b"")
         self._cache[key] = b"".join(parts)
-        while len(self._cache) > CACHE_SENTENCES:
-            self._cache.popitem(last=False)
+        self._cache_bytes += size - len(previous)
+        while len(self._cache) > CACHE_SENTENCES or self._cache_bytes > CACHE_BYTES:
+            _, audio = self._cache.popitem(last=False)
+            self._cache_bytes -= len(audio)
 
     async def _speak(self, text: str) -> AsyncIterator[bytes]:
         carry = b""  # HTTP chunk boundaries can split a 16-bit sample; never emit an odd number of bytes
@@ -152,7 +164,7 @@ class DeepgramTTS:
             if resp.status_code >= 400:
                 body = (await resp.aread()).decode("utf-8", errors="replace")[:300]
                 raise RuntimeError(f"Deepgram TTS {resp.status_code}: {body}")
-            async for chunk in resp.aiter_bytes(4096):
+            async for chunk in resp.aiter_bytes():
                 data = carry + chunk
                 if len(data) % 2:
                     data, carry = data[:-1], data[-1:]

@@ -1,7 +1,7 @@
 """Per-connection voice pipeline: acknowledgement, speculative turns, streaming text + TTS.
 
 Latency tricks used by production voice agents, applied here:
-- ack:          a cached "Okay." is sent the instant the final transcript arrives (~0 ms of model time).
+- ack:          a cached "Okay." is sent after a short delay unless the reply is ready first.
 - speculation:  the model starts on the interim transcript; output is buffered and released ("committed")
                 when the final transcript matches, otherwise the run is cancelled. Side-effecting tools
                 (booking, remembering) wait behind the commit gate, so a cancelled guess never books anything.
@@ -43,7 +43,7 @@ def describe_error(exc: Exception) -> dict:
     if "429" in lowered or "resource_exhausted" in lowered or "quota" in lowered or "rate limit" in lowered:
         return {
             "code": "rate_limit",
-            "message": "The model's rate limit is exhausted (free tier). Wait a minute and try again; if it persists, the daily cap is reached.",
+            "message": "The model's rate limit was reached. Wait a minute and try again; if it persists, check the provider's quota and billing.",
             "detail": text[:300],
         }
     if "503" in lowered or "unavailable" in lowered or "high demand" in lowered or "overloaded" in lowered:
@@ -56,7 +56,7 @@ def describe_error(exc: Exception) -> dict:
 
 
 def normalise(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]+", "", text.lower()).strip()
+    return " ".join(re.sub(r"[^\w\s]", "", text.casefold()).split())
 
 
 class Turn:
@@ -203,17 +203,18 @@ class Turn:
                             "listen_after": len(self.agent.session.booked) == booked_before,
                         }
                     )
-        except asyncio.CancelledError:
-            producer.cancel()
-            speaker.cancel()
-            raise
+            sentences.put_nowait(None)
+            await speaker
+            await self._emit({"type": "audio_end"})
         except Exception as exc:
             log.exception("turn failed")
+            self.pipeline.cancel_pending_ack()
             await self._emit({"type": "error", **describe_error(exc)})
         finally:
-            sentences.put_nowait(None)
-        await speaker
-        await self._emit({"type": "audio_end"})
+            # Also drain children if cancellation happens during TTS playback or a WebSocket send fails.
+            producer.cancel()
+            speaker.cancel()
+            await asyncio.gather(producer, speaker, return_exceptions=True)
 
 
 class VoicePipeline:
@@ -258,7 +259,7 @@ class VoicePipeline:
         self.current.agent.tools.commit_gate = self.current.gate
 
     async def on_final(self, text: str) -> None:
-        """Final transcript: commit a matching guess, otherwise acknowledge instantly and start a live turn."""
+        """Final transcript: commit a matching guess or schedule an acknowledgement and start a live turn."""
         cur = self.current
         if cur and cur.speculative and not cur.committed and normalise(cur.text) == normalise(text):
             self.stats["hit"] += 1
@@ -289,6 +290,12 @@ class VoicePipeline:
         if self.stats["started"]:
             log.info("speculation stats for this connection: %s", self.stats)
 
+    async def aclose(self) -> None:
+        """Cancel and drain the active turn before replacing or closing a connection."""
+        tasks = [task for task in (self.current.task if self.current else None, self._pending_ack) if task]
+        self.close()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     def _cancel_current(self) -> None:
         self.cancel_pending_ack()
         if self.current and not self.current.done:
@@ -316,6 +323,8 @@ class VoicePipeline:
 
     async def _send_ack(self) -> None:
         phrase = secrets.choice(ACK_PHRASES)
-        await self.send({"type": "ack", "text": phrase, "audio": phrase in self.ack_audio})
-        if phrase in self.ack_audio:
-            await self.send(self.ack_audio[phrase])
+        # Keep the role marker and its PCM together; reply audio can arrive concurrently.
+        async with self.lock:
+            await self.raw_send({"type": "ack", "text": phrase, "audio": phrase in self.ack_audio})
+            if phrase in self.ack_audio:
+                await self.raw_send(self.ack_audio[phrase])

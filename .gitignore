@@ -6,5 +6,6 @@ token.json
 credentials.json
 .pytest_cache/
 .DS_Store
+.ruff_cache/
 tests/
 docs/

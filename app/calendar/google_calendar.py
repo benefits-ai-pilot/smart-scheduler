@@ -8,10 +8,13 @@ import time
 import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
+from threading import Lock
+from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from .base import BusyPeriod, Event, Holiday
 
@@ -45,8 +48,13 @@ class GoogleCalendar:
         self.calendar_id = calendar_id
         self.holiday_calendar_id = holiday_calendar_id  # None = no holiday awareness
         self._holiday_cache: tuple[str, float, list[Holiday]] | None = None
+        self._request_lock = Lock()  # snapshot and tool workers share a non-thread-safe HTTP transport
         # cache_discovery=False avoids a noisy warning about the file cache in server envs.
         self.service = build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+    def _execute(self, request):
+        with self._request_lock:
+            return request.execute()
 
     @classmethod
     def from_token(
@@ -83,7 +91,7 @@ class GoogleCalendar:
 
     def probe(self) -> dict:
         """Cheap call for validating the token; returns the calendar's identity for the UI."""
-        cal = self.service.calendars().get(calendarId=self.calendar_id).execute()
+        cal = self._execute(self.service.calendars().get(calendarId=self.calendar_id))
         return {
             "id": cal.get("id", self.calendar_id),
             "summary": cal.get("summary", ""),
@@ -94,12 +102,11 @@ class GoogleCalendar:
         """Public holidays in the range from Google's regional holiday calendar (observances are skipped)."""
         if not self.holiday_calendar_id:
             return []
-        key = f"{start.date()}..{end.date()}"
+        key = f"{self.holiday_calendar_id}:{start.date()}..{end.date()}"
         if self._holiday_cache and self._holiday_cache[0] == key and time.time() - self._holiday_cache[1] < 6 * 3600:
             return self._holiday_cache[2]
-        resp = (
-            self.service.events()
-            .list(
+        resp = self._execute(
+            self.service.events().list(
                 calendarId=self.holiday_calendar_id,
                 timeMin=start.astimezone(UTC).isoformat(),
                 timeMax=end.astimezone(UTC).isoformat(),
@@ -107,7 +114,6 @@ class GoogleCalendar:
                 orderBy="startTime",
                 maxResults=100,
             )
-            .execute()
         )
         found: list[Holiday] = []
         for item in resp.get("items", []):
@@ -120,17 +126,14 @@ class GoogleCalendar:
 
     def busy_periods(self, start: datetime, end: datetime) -> list[BusyPeriod]:
         # events.list (rather than freebusy) so conflicts can be explained by title.
-        return [
-            BusyPeriod(e.start, e.end, e.title)
-            for e in self._list(start, end)
-            if not e.description.startswith("__all_day__")
-        ]
+        return [BusyPeriod(e.start, e.end, e.title) for e in self._list(start, end) if e.blocks_time]
 
     def search_events(self, start: datetime, end: datetime, query: str | None = None) -> list[Event]:
         return self._list(start, end, query)
 
     def create_event(self, title: str, start: datetime, end: datetime, description: str = "") -> Event:
         body = {
+            "id": uuid.uuid4().hex,
             "summary": title,
             "description": description,
             "start": {"dateTime": start.isoformat()},
@@ -140,22 +143,26 @@ class GoogleCalendar:
             },
         }
         try:
-            created = (
-                self.service.events().insert(calendarId=self.calendar_id, body=body, conferenceDataVersion=1).execute()
+            created = self._execute(
+                self.service.events().insert(calendarId=self.calendar_id, body=body, conferenceDataVersion=1)
             )
-        except Exception as exc:  # e.g. Meet not allowed on this calendar -> retry without it
+        except HttpError as exc:
+            # Only a definitive conference-validation rejection can be retried without Meet.
+            # A timeout or 5xx may follow a successful insert; retrying could create a duplicate.
+            if exc.resp.status != 400 or "conference" not in str(exc).lower():
+                raise
             log.warning("insert with Meet failed (%s); retrying without conference", exc)
             body.pop("conferenceData")
-            created = self.service.events().insert(calendarId=self.calendar_id, body=body).execute()
+            created = self._execute(self.service.events().insert(calendarId=self.calendar_id, body=body))
         return self._to_event(created)
 
     def _list(self, start: datetime, end: datetime, query: str | None = None) -> list[Event]:
         items: list[dict] = []
         page_token = None
+        calendar_tz = start.tzinfo
         while True:
-            resp = (
-                self.service.events()
-                .list(
+            resp = self._execute(
+                self.service.events().list(
                     calendarId=self.calendar_id,
                     timeMin=start.astimezone(UTC).isoformat(),
                     timeMax=end.astimezone(UTC).isoformat(),
@@ -165,29 +172,34 @@ class GoogleCalendar:
                     maxResults=250,
                     pageToken=page_token,
                 )
-                .execute()
             )
             items.extend(resp.get("items", []))
+            if resp.get("timeZone"):
+                calendar_tz = ZoneInfo(resp["timeZone"])
             page_token = resp.get("nextPageToken")
             if not page_token:
                 break
         events = []
         for item in items:
-            if item.get("status") == "cancelled" or item.get("transparency") == "transparent":
-                continue  # declined/free-time events don't block
-            ev = self._to_event(item)
+            if item.get("status") == "cancelled":
+                continue
+            ev = self._to_event(item, calendar_tz)
             if ev is not None:
                 events.append(ev)
         return events
 
     @staticmethod
-    def _to_event(item: dict) -> Event | None:
+    def _to_event(item: dict, calendar_tz=UTC) -> Event | None:
         start, end = item.get("start", {}), item.get("end", {})
+        blocks_time = item.get("transparency") != "transparent" and not any(
+            attendee.get("self") and attendee.get("responseStatus") == "declined"
+            for attendee in item.get("attendees", [])
+        )
         if "dateTime" not in start:
-            # All-day event: keep it searchable but mark so it doesn't block slots.
+            # All-day ends are exclusive, in the calendar's timezone, just like timed busy periods.
             try:
-                s = datetime.fromisoformat(start["date"]).replace(tzinfo=UTC)
-                e = datetime.fromisoformat(end["date"]).replace(tzinfo=UTC)
+                s = datetime.fromisoformat(start["date"]).replace(tzinfo=calendar_tz)
+                e = datetime.fromisoformat(end["date"]).replace(tzinfo=calendar_tz)
             except (KeyError, ValueError):
                 return None
             return Event(
@@ -195,8 +207,9 @@ class GoogleCalendar:
                 item.get("summary", "(no title)"),
                 s,
                 e,
-                "__all_day__ " + item.get("description", ""),
+                item.get("description") or "",
                 item.get("htmlLink", ""),
+                blocks_time=blocks_time,
             )
         return Event(
             id=item["id"],
@@ -205,4 +218,5 @@ class GoogleCalendar:
             end=datetime.fromisoformat(end["dateTime"]),
             description=item.get("description", "") or "",
             link=item.get("hangoutLink") or item.get("htmlLink", ""),
+            blocks_time=blocks_time,
         )

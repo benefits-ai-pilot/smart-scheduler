@@ -11,12 +11,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.agent.agent import Agent
 from app.agent.llm import build_llm
-from app.agent.session import Session
+from app.agent.session import DEFAULT_PREFERENCES, Session
 from app.calendar.google_calendar import GoogleCalendar, holiday_calendar_for
 from app.config import Settings, get_settings
 from app.routers import calendar, chat
@@ -61,6 +61,7 @@ class Runtime:
         except Exception as exc:  # no key / no ADC / API disabled -> browser voice fallback
             log.warning("Server TTS unavailable (%s); falling back to browser speech synthesis", exc)
         self.sessions: dict[str, Agent] = {}
+        self.user_preferences: dict[str, dict[str, str]] = {}
         self.user_calendars: dict[str, tuple[GoogleCalendar, dict]] = {}  # browser uid -> connected calendar
         self.ack_audio: dict[str, bytes] = {}
         self._background: set[asyncio.Task[None]] = set()  # strong refs so fire-and-forget tasks are not GC'd
@@ -96,7 +97,7 @@ class Runtime:
 
     async def connect_user_calendar(self, uid: str, raw_token_json: str) -> dict:
         """Validate a token against Google and attach that calendar to this browser."""
-        calendar = GoogleCalendar.from_json(raw_token_json, self.settings.google_calendar_id)
+        calendar = await asyncio.to_thread(GoogleCalendar.from_json, raw_token_json, self.settings.google_calendar_id)
         info = await asyncio.to_thread(calendar.probe)  # raises if Google rejects the token
         calendar.holiday_calendar_id = self.holiday_calendar(info.get("timezone") or self.settings.default_timezone)
         self.user_calendars[uid] = (calendar, info)
@@ -145,7 +146,12 @@ class Runtime:
         except ZoneInfoNotFoundError:
             tz = ZoneInfo(self.settings.default_timezone)
         s = self.settings
-        agent = Agent(self.llm, calendar, Session(tz=tz), s.work_day_start, s.work_day_end, s.slot_step_minutes)
+        session = Session(tz=tz)
+        if uid:
+            store = self.user_preferences.setdefault(uid, dict(DEFAULT_PREFERENCES))
+            session.preferences = dict(store)
+            session.preference_store = store
+        agent = Agent(self.llm, calendar, session, s.work_day_start, s.work_day_end, s.slot_step_minutes)
         agent.owner = uid
         if len(self.sessions) >= MAX_SESSIONS:  # simple bound for the in-memory store
             self.sessions.pop(next(iter(self.sessions)))
@@ -193,7 +199,7 @@ app.include_router(calendar.router)
 
 
 @app.get("/")
-async def index(response: Response, request: Request):
+async def index(request: Request):
     resp = FileResponse(STATIC / "index.html")
     if not request.cookies.get(UID_COOKIE):
         # Lax: still sent on the top-level redirect back from Google's consent page.

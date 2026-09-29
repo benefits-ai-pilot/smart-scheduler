@@ -128,6 +128,7 @@ TOOL_SPECS = [
 
 
 SIDE_EFFECT_TOOLS = {"create_event", "remember_preference"}
+TOOL_NAMES = {tool.name for tool in TOOL_SPECS}
 
 
 class ToolRunner:
@@ -150,9 +151,9 @@ class ToolRunner:
         self.commit_gate = commit_gate
 
     async def dispatch(self, name: str, args: dict, now: datetime) -> dict:
-        handler = getattr(self, f"_{name}", None)
-        if handler is None:
+        if name not in TOOL_NAMES:
             return {"error": f"unknown tool {name}"}
+        handler = getattr(self, f"_{name}")
         if name in SIDE_EFFECT_TOOLS and self.commit_gate is not None:
             await self.commit_gate.wait()
         try:
@@ -196,15 +197,15 @@ class ToolRunner:
             window_start=start,
             window_end=end,
             duration=timedelta(minutes=int(a["duration_minutes"])),
-            earliest_hour=float(a.get("earliest_hour") or earliest),
-            latest_hour=float(a.get("latest_hour") or latest),
+            earliest_hour=float(a.get("earliest_hour", earliest)),
+            latest_hour=float(a.get("latest_hour", latest)),
             exclude_weekdays={
                 WEEKDAYS[d[:3].lower()] for d in a.get("exclude_weekdays") or [] if d[:3].lower() in WEEKDAYS
             },
             include_weekends=bool(a.get("include_weekends", False)),
             buffer_minutes=int(a.get("buffer_minutes") or 0),
             step_minutes=self.step_minutes,
-            max_results=int(a.get("max_results") or 3),
+            max_results=min(int(a.get("max_results", 3)), 200),
         )
         busy = self.calendar.busy_periods(start - timedelta(days=1), end + timedelta(days=7))
         holidays = self.calendar.holidays(start, end + timedelta(days=7))

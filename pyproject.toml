@@ -10,6 +10,7 @@ dependencies = [
     "websockets>=16,<17",
     "pydantic-settings>=2.15,<3",
     "python-dotenv>=1.2,<2",
+    "httpx>=0.28,<1",
     "anthropic>=1.8,<2",
     "openai>=1.100,<4",
     "google-genai>=2.25,<3",
@@ -21,7 +22,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28,<1",
+    "ruff>=0.16,<1",
 ]
 
 [build-system]

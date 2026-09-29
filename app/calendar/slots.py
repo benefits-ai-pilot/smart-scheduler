@@ -6,6 +6,7 @@ when nothing fits, proposes alternatives so the agent can resolve conflicts grac
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
 
@@ -27,6 +28,14 @@ class SlotQuery:
     max_results: int = 3
     max_per_day: int = 2
 
+    def __post_init__(self) -> None:
+        if self.duration <= timedelta(0) or self.step_minutes <= 0:
+            raise ValueError("duration and step_minutes must be positive")
+        if not 0 <= self.earliest_hour < self.latest_hour <= 24:
+            raise ValueError("hours must satisfy 0 <= earliest_hour < latest_hour <= 24")
+        if self.buffer_minutes < 0 or self.max_results <= 0 or self.max_per_day <= 0:
+            raise ValueError("buffer must be nonnegative and result limits must be positive")
+
 
 @dataclass
 class Slot:
@@ -45,12 +54,9 @@ def _fmt_time(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
 
 
-def _hour_to_time(hour: float) -> time:
-    h = int(hour)
-    m = round((hour - h) * 60)
-    if h >= 24:
-        return time(23, 59)
-    return time(h, m)
+def _at_hour(day: date, hour: float, tz) -> datetime:
+    """Include midnight at hour 24 and round fractional hours without producing minute 60."""
+    return datetime.combine(day, time.min, tzinfo=tz) + timedelta(minutes=round(hour * 60))
 
 
 def _merge(periods: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
@@ -92,46 +98,19 @@ def _round_up(dt: datetime, step: timedelta) -> datetime:
 
 def find_free_slots(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None = None) -> list[Slot]:
     """Return free slots (chronological, capped per day and overall)."""
-    tz = query.window_start.tzinfo
-    buffer = timedelta(minutes=query.buffer_minutes)
     step = timedelta(minutes=query.step_minutes)
-    busy_iv = _merge([(b.start.astimezone(tz) - buffer, b.end.astimezone(tz) + buffer) for b in busy])
-
     slots: list[Slot] = []
-    day = query.window_start.astimezone(tz).date()
-    last_day = query.window_end.astimezone(tz).date()
-    while day <= last_day and len(slots) < query.max_results:
-        weekday = day.weekday()
-        skip = (
-            weekday in query.exclude_weekdays
-            or (weekday >= 5 and not query.include_weekends)
-            or day in query.exclude_dates
-        )
-        if not skip:
-            day_start = datetime.combine(day, _hour_to_time(query.earliest_hour), tzinfo=tz)
-            day_end = datetime.combine(day, _hour_to_time(query.latest_hour), tzinfo=tz)
-            day_start = max(day_start, query.window_start.astimezone(tz))
-            day_end = min(day_end, query.window_end.astimezone(tz))
-            if now is not None:
-                day_start = max(day_start, now.astimezone(tz))
-            day_slots: list[Slot] = []
-            for free_start, free_end in _free_intervals(day_start, day_end, busy_iv):
-                # Candidate starts: the interval start itself, then aligned grid points.
-                candidates = [free_start, _round_up(free_start, step)]
-                cursor = candidates[-1] + step
-                while cursor + query.duration <= free_end:
-                    candidates.append(cursor)
-                    cursor += step
-                for start in candidates:
-                    end = start + query.duration
-                    if end <= free_end and (not day_slots or start >= day_slots[-1].end):
-                        day_slots.append(Slot(start, end))
-                        if len(day_slots) >= query.max_per_day:
-                            break
-                if len(day_slots) >= query.max_per_day:
-                    break
-            slots.extend(day_slots[: query.max_results - len(slots)])
-        day += timedelta(days=1)
+    counts: dict[date, int] = {}
+    for start, free_end in _query_free_intervals(busy, query, now):
+        day = start.date()
+        while start + query.duration <= free_end and counts.get(day, 0) < query.max_per_day:
+            end = start + query.duration
+            slots.append(Slot(start, end))
+            counts[day] = counts.get(day, 0) + 1
+            if len(slots) >= query.max_results:
+                return slots
+            # Jump straight to the next nonoverlapping grid point instead of building all candidates.
+            start = _round_up(end, step)
     return slots
 
 
@@ -139,10 +118,25 @@ def free_blocks(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None =
     """Free intervals (within the query's hours) per day of the window, regardless of the meeting length.
 
     Lets the agent say "Monday afternoon is free" or "you have 2 to 5 open" instead of listing arbitrary starts."""
+    return [
+        {
+            "date": start.date().isoformat(),
+            "from": _fmt_time(start),
+            "to": _fmt_time(end),
+            "minutes": int((end - start).total_seconds() // 60),
+        }
+        for start, end in _query_free_intervals(busy, query, now)
+        if end - start >= query.duration
+    ]
+
+
+def _query_free_intervals(
+    busy: list[BusyPeriod], query: SlotQuery, now: datetime | None
+) -> Iterator[tuple[datetime, datetime]]:
+    """Apply the same hours, exclusions, and buffers to slot search and free-block summaries."""
     tz = query.window_start.tzinfo
     buffer = timedelta(minutes=query.buffer_minutes)
     busy_iv = _merge([(b.start.astimezone(tz) - buffer, b.end.astimezone(tz) + buffer) for b in busy])
-    out: list[dict] = []
     day = query.window_start.astimezone(tz).date()
     last_day = query.window_end.astimezone(tz).date()
     while day <= last_day:
@@ -153,22 +147,12 @@ def free_blocks(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None =
             or day in query.exclude_dates
         )
         if not skip:
-            day_start = max(datetime.combine(day, _hour_to_time(query.earliest_hour), tzinfo=tz), query.window_start)
-            day_end = min(datetime.combine(day, _hour_to_time(query.latest_hour), tzinfo=tz), query.window_end)
+            day_start = max(_at_hour(day, query.earliest_hour, tz), query.window_start)
+            day_end = min(_at_hour(day, query.latest_hour, tz), query.window_end)
             if now is not None:
                 day_start = max(day_start, now.astimezone(tz))
-            for free_start, free_end in _free_intervals(day_start, day_end, busy_iv):
-                if free_end - free_start >= query.duration:
-                    out.append(
-                        {
-                            "date": day.isoformat(),
-                            "from": _fmt_time(free_start),
-                            "to": _fmt_time(free_end),
-                            "minutes": int((free_end - free_start).total_seconds() // 60),
-                        }
-                    )
+            yield from _free_intervals(day_start, day_end, busy_iv)
         day += timedelta(days=1)
-    return out
 
 
 def find_alternatives(busy: list[BusyPeriod], query: SlotQuery, now: datetime | None = None) -> list[dict]:

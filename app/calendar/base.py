@@ -15,6 +15,7 @@ class Event:
     end: datetime  # timezone-aware
     description: str = ""
     link: str = ""
+    blocks_time: bool = True
 
     def to_dict(self) -> dict:
         return {

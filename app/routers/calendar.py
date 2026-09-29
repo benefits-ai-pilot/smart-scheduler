@@ -8,6 +8,7 @@ Disconnecting reverts the visitor to the deployment's default calendar, if one i
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -97,12 +98,14 @@ async def oauth_callback(request: Request, state: str = "", code: str = "", erro
     entry = _pending_states.pop(state, None)
     if error or entry is None or not code:
         return RedirectResponse(f"/?calendar=error&reason={error or 'invalid_state'}", status_code=302)
-    uid, _, code_verifier, redirect_uri = entry
+    uid, created_at, code_verifier, redirect_uri = entry
+    if time.time() - created_at > STATE_TTL_S:
+        return RedirectResponse("/?calendar=error&reason=expired_state", status_code=302)
     if uid != browser_uid(request.cookies):
         return RedirectResponse("/?calendar=error&reason=cookie_mismatch", status_code=302)
     try:
         flow = _flow(rt, redirect_uri, code_verifier)
-        flow.fetch_token(code=code)
+        await asyncio.to_thread(flow.fetch_token, code=code)
         await rt.connect_user_calendar(uid, flow.credentials.to_json())
     except Exception as exc:
         log.warning("Google sign-in failed at token exchange: %s: %s", type(exc).__name__, exc)

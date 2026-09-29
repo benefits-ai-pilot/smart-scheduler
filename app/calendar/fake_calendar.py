@@ -31,7 +31,7 @@ class FakeCalendar:
         return [
             BusyPeriod(e.start, e.end, e.title)
             for e in sorted(self.events, key=lambda e: e.start)
-            if e.end > start and e.start < end
+            if e.blocks_time and e.end > start and e.start < end
         ]
 
     def search_events(self, start: datetime, end: datetime, query: str | None = None) -> list[Event]:

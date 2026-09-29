@@ -19,7 +19,11 @@ router = APIRouter()
 @router.post("/api/chat")
 async def chat(body: ChatIn, request: Request):
     rt: Runtime = request.app.state.rt
-    agent = rt.sessions.get(body.session_id or "") or rt.new_agent(body.timezone, browser_uid(request.cookies))
+    uid = browser_uid(request.cookies)
+    agent = rt.sessions.get(body.session_id or "")
+    if agent is not None and agent.owner != uid:
+        raise HTTPException(404, "session_not_found")
+    agent = agent or rt.new_agent(body.timezone, uid)
     tool_calls, reply = [], ""
     async for ev in agent.run_turn(body.text):
         if ev.type == "tool_call":
@@ -48,6 +52,12 @@ async def ws_endpoint(ws: WebSocket):
     pipeline: VoicePipeline | None = None
     stt: DeepgramSTT | None = None
 
+    async def on_final(text: str) -> None:
+        if pipeline is not None:
+            await pipeline.on_final(text)
+            # Speculation may replace the agent; keep HTTP continuation and ownership checks current.
+            rt.sessions[pipeline.agent.session.id] = pipeline.agent
+
     async def on_transcript(event: tuple) -> None:
         """Deepgram events -> UI updates + pipeline turns (same path as the browser recogniser)."""
         if pipeline is None:
@@ -58,7 +68,7 @@ async def ws_endpoint(ws: WebSocket):
             await pipeline.on_partial(event[1])
         elif kind == "final" and event[1].strip():
             await raw_send({"type": "transcript", "final": True, "text": event[1], "speech_end_ago_ms": event[2]})
-            await pipeline.on_final(event[1])
+            await on_final(event[1])
         elif kind == "error":
             await raw_send({"type": "error", "message": f"speech recognition: {event[1]}"})
 
@@ -80,6 +90,10 @@ async def ws_endpoint(ws: WebSocket):
             msg = json.loads(packet.get("text") or "{}")
             kind = msg.get("type")
             if kind == "hello":
+                await stop_stt()
+                if pipeline is not None:
+                    await pipeline.aclose()
+                    pipeline = None
                 try:
                     agent = rt.new_agent(msg.get("timezone"), browser_uid(ws.cookies))
                 except HTTPException as exc:
@@ -133,7 +147,7 @@ async def ws_endpoint(ws: WebSocket):
             elif kind == "user_partial":
                 await pipeline.on_partial(msg.get("text", ""))
             elif kind == "user_text":
-                await pipeline.on_final(msg["text"])
+                await on_final(msg["text"])
             elif kind == "cancel":
                 pipeline.on_cancel()
     except WebSocketDisconnect:
@@ -143,4 +157,4 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         await stop_stt()
         if pipeline is not None:
-            pipeline.close()
+            await pipeline.aclose()
