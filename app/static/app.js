@@ -3,32 +3,20 @@
   const $ = (id) => document.getElementById(id);
   const transcript = $("transcript"), mic = $("mic"), interim = $("interim");
   const state = { ws: null, listening: false, speaking: false, sampleRate: 24000, serverTTS: true,
-                  sentAt: 0, speechEndAt: 0, firstTokenAt: 0, firstAudioAt: 0, firstSoundAt: 0, answerAt: 0,
-                  audioRole: "reply", sawTool: false, afterToolResult: false,
+                  speechEndAt: 0, audioRole: "reply",
                   botEl: null, botText: "", lastPartial: "", partialTimer: null };
 
-  // ---------- latency bookkeeping ----------
-  // t0 is the recogniser's end-of-speech event when we have one (typed input falls back to submit time).
-  // Audio moments are stamped at scheduled playback time, not at byte arrival, so a queued "Okay." cannot
-  // make the real answer look earlier than it is heard.
-  const samples = { plain: { sound: [], reply: [] }, tool: { sound: [], reply: [], answer: [] } };
-  const pct = (arr, q) => { if (!arr.length) return null; const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(q * a.length))]; };
-  const renderStats = () => {
-    const line = (name, arr) => arr.length ? `${name} n=${arr.length} p50 ${pct(arr, 0.5)} ms p95 ${pct(arr, 0.95)} ms` : null;
-    const rows = [line("plain · first sound", samples.plain.sound), line("plain · reply audio", samples.plain.reply),
-                  line("tool · first sound", samples.tool.sound), line("tool · reply audio", samples.tool.reply), line("tool · answer", samples.tool.answer)].filter(Boolean);
-    $("stats").textContent = rows.join("   ·   ");
-  };
-  const record = (kind, ms) => { const cat = state.sawTool ? "tool" : "plain"; if (samples[cat][kind]) { samples[cat][kind].push(ms); renderStats(); } };
-  const markSound = (at) => { if (!state.firstSoundAt) { state.firstSoundAt = at; setLatency("lat-ack", Math.round(at - state.sentAt)); } };
-  const markReply = (at) => {
-    if (!state.firstAudioAt) { state.firstAudioAt = at; setLatency("lat-audio", Math.round(at - state.sentAt)); }
-    if (state.afterToolResult && !state.answerAt) { state.answerAt = at; setLatency("lat-answer", Math.round(at - state.sentAt)); }
-  };
-  const finishTurnStats = () => {
-    if (state.firstSoundAt) record("sound", Math.round(state.firstSoundAt - state.sentAt));
-    if (state.firstAudioAt) record("reply", Math.round(state.firstAudioAt - state.sentAt));
-    if (state.sawTool && state.answerAt) record("answer", Math.round(state.answerAt - state.sentAt));
+  // ---------- turn timing (console only) ----------
+  // No timings are shown in the UI; one debug line per turn is logged for your own measurements.
+  const timing = { t0: 0, firstSound: 0, firstReply: 0, tool: false };
+  const resetTiming = (t0) => { timing.t0 = t0; timing.firstSound = 0; timing.firstReply = 0; timing.tool = false; };
+  const markSound = (at) => { if (!timing.firstSound) timing.firstSound = at; };
+  const markReply = (at) => { if (!timing.firstReply) timing.firstReply = at; };
+  const logTurnTiming = () => {
+    if (!timing.t0) return;
+    const ms = (t) => (t ? Math.round(t - timing.t0) + " ms" : "–");
+    console.debug(`[turn] ${timing.tool ? "tool" : "plain"} · end of speech → first sound ${ms(timing.firstSound)} · → reply audio ${ms(timing.firstReply)}`);
+    timing.t0 = 0;
   };
 
   // ---------- transcript helpers ----------
@@ -38,7 +26,6 @@
     el.innerHTML = `<summary>${name}(${Object.keys(args).join(", ")})</summary><pre>${JSON.stringify(args, null, 1)}</pre>`;
     transcript.appendChild(el); transcript.scrollTop = transcript.scrollHeight; return el;
   };
-  const setLatency = (id, ms) => { const el = $(id); el.textContent = ms + " ms"; el.className = ms < 800 ? "good" : "bad"; };
 
   // ---------- audio playback (PCM 16-bit -> Web Audio) ----------
   let ctx = null, nextTime = 0, sources = [];
@@ -56,7 +43,7 @@
   };
   const stopAudio = () => { sources.forEach((s) => { try { s.stop(); } catch (_) {} }); sources = []; nextTime = 0; window.speechSynthesis?.cancel(); };
   const onSpeechDone = () => {
-    state.speaking = false; mic.classList.remove("speaking"); finishTurnStats();
+    state.speaking = false; mic.classList.remove("speaking"); logTurnTiming();
     if ($("autolisten").checked && state.listenAfter !== false && !state.listening) startListening();
     state.listenAfter = true;
   };
@@ -159,16 +146,14 @@
           state.audioRole = "ack";
           if (!m.audio) speakBrowser(m.text, true);
           break;
-        case "speculation": $("stats").title = `speculation: ${m.hit} hit / ${m.miss} miss / ${m.cancelled} cancelled, ack skipped ${m.ack_skipped}`; break;
         case "reply_audio_start": state.audioRole = "reply"; break;
         case "token":
-          if (!state.firstTokenAt) { state.firstTokenAt = performance.now(); setLatency("lat-token", Math.round(state.firstTokenAt - state.sentAt)); }
           if (!state.botEl) state.botEl = addMsg("bot", ""); state.botText += m.text; state.botEl.textContent = state.botText; transcript.scrollTop = transcript.scrollHeight; break;
-        case "tool_call": state.sawTool = true; addTool(m.name, m.args); break;
-        case "tool_result": { state.afterToolResult = true; const last = transcript.querySelector("details.tool:last-of-type"); if (last) last.querySelector("pre").textContent += "\n→ " + JSON.stringify(m.result, null, 1); break; }
+        case "tool_call": timing.tool = true; addTool(m.name, m.args); break;
+        case "tool_result": { const last = transcript.querySelector("details.tool:last-of-type"); if (last) last.querySelector("pre").textContent += "\n→ " + JSON.stringify(m.result, null, 1); break; }
         case "turn_end":
           state.listenAfter = m.listen_after !== false;  // false after a booking: the goal is reached, keep the mic closed
-          setLatency("lat-llm", m.llm_ms); if (state.botEl) state.botEl.textContent = m.text || state.botText;
+          if (state.botEl) state.botEl.textContent = m.text || state.botText;
           if (!state.serverTTS) { state.speaking = true; speakBrowser(m.text); } break;
         case "audio_end": if (state.serverTTS && !sources.length) onSpeechDone(); break;
         case "tts_error": if (!state.speaking) speakBrowser(state.botText); break;
@@ -182,10 +167,8 @@
     text = text.trim(); if (!text || !state.ws || state.ws.readyState !== 1) return;
     stopAudio(); if (state.speaking && send) state.ws.send(JSON.stringify({ type: "cancel" }));
     state.speaking = false; mic.classList.remove("speaking");
-    addMsg("user", text); state.botEl = null; state.botText = ""; state.firstTokenAt = 0; state.firstAudioAt = 0; state.firstSoundAt = 0; state.answerAt = 0;
-    state.sawTool = false; state.afterToolResult = false; state.audioRole = "reply"; state.lastPartial = ""; clearTimeout(state.partialTimer);
-    state.sentAt = sentAt; state.speechEndAt = 0;
-    ["lat-ack", "lat-audio", "lat-answer", "lat-token", "lat-llm"].forEach((id) => { $(id).textContent = "–"; $(id).className = ""; });
+    addMsg("user", text); state.botEl = null; state.botText = ""; state.audioRole = "reply"; state.lastPartial = ""; clearTimeout(state.partialTimer);
+    resetTiming(sentAt); state.speechEndAt = 0;
     ensureCtx(); if (send) state.ws.send(JSON.stringify({ type: "user_text", text }));
   };
   const sendText = (text) => {

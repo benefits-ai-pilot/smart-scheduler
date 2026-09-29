@@ -49,11 +49,12 @@ Open http://localhost:8080, click the microphone (or hold Space) and talk. There
 
 Visitors can connect their own calendar from the **Calendar** button in the header ("Sign in with Google"). Each browser gets its own calendar; disconnecting reverts to the server's default one. On a public URL this needs a *Web application* OAuth client with `<PUBLIC_BASE_URL>/api/calendar/oauth/callback` registered as a redirect URI, set via `GOOGLE_OAUTH_CLIENT_JSON` and `PUBLIC_BASE_URL`.
 
-### 3. Tests and scenarios
+### 3. Scenario replay
+
+Replays the assignment's conversations against the live model and your calendar, printing each turn and tool call:
 
 ```bash
-uv run pytest
-uv run scripts/run_scenarios.py      # replays the assignment's scenarios against the live model and calendar
+uv run scripts/run_scenarios.py
 ```
 
 ### 4. Deploy
@@ -74,7 +75,7 @@ Use a US region: the model APIs are served from the US, so each model call saves
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLM_PROVIDER` | `auto` | `anthropic`, `gemini` or `openai`; `auto` picks the first key that is set |
-| `ANTHROPIC_MODEL` | `claude-opus-5` | Most accurate in testing. `claude-haiku-4-5` is faster but less reliable |
+| `ANTHROPIC_MODEL` | `claude-opus-5` | Most accurate in practice. `claude-haiku-4-5` is faster but less reliable |
 | `GEMINI_MODEL` / `GEMINI_FALLBACK_MODEL` | `gemini-2.5-flash` / `gemini-flash-lite-latest` | Fallback is used automatically on 429/503 for five minutes |
 | `OPENAI_BASE_URL` | | Point at OpenRouter, Groq or Ollama for any Chat Completions server |
 | `STT_PROVIDER` | `auto` | `deepgram` streams the mic to Nova-3 with 300 ms endpointing; `browser` uses Chrome's Web Speech API |
@@ -84,14 +85,14 @@ Use a US region: the model APIs are served from the US, so each model call saves
 | `WORK_DAY_START` / `WORK_DAY_END` | `9` / `18` | Working hours for slot search |
 | `DEFAULT_TIMEZONE` | `Asia/Kolkata` | Used when the browser sends none |
 
-Note on the Gemini free tier: `gemini-2.5-flash` allows 5 requests a minute and 20 a day, which is enough for local testing but not for a public demo link.
+Note on the Gemini free tier: `gemini-2.5-flash` allows 5 requests a minute and 20 a day, which is enough for local use but not for a public demo link.
 
 ## How it works
 
 ```
 Browser                                       FastAPI server
 mic (AudioWorklet)  ──── PCM audio ────────▶  Deepgram STT (streaming, 300 ms endpointing)
-transcript + latency HUD ◀── transcript ────  agent loop: LLM ⇄ tools ⇄ Google Calendar
+transcript            ◀── transcript ────  agent loop: LLM ⇄ tools ⇄ Google Calendar
 Web Audio playback       ◀── tokens, PCM ───  sentence chunker → TTS (Deepgram / Google)
 ```
 
@@ -110,7 +111,6 @@ Web Audio playback       ◀── tokens, PCM ───  sentence chunker → T
 - Bookings and preference saves are confirmed from a template instead of a second model call.
 - Optionally, generation starts on the interim transcript and is committed only if the final transcript matches; side-effecting tools wait behind a commit gate so a cancelled guess never books anything.
 
-The HUD measures from the recogniser's end-of-speech event to actual playback and shows rolling p50/p95, split into plain and calendar turns.
 
 ## Optimizations
 

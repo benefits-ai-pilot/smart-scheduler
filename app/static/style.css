@@ -8,10 +8,7 @@ h1 { margin:0; font-size:22px; } .sub { margin:4px 0 0; color:var(--muted); font
 .pill { font-size:12px; padding:4px 10px; border-radius:999px; background:var(--panel); border:1px solid var(--line); color:var(--muted); }
 .pill.ok { color:var(--ok); border-color:var(--ok); } .pill.warn { color:var(--warn); border-color:var(--warn); }
 .hud { display:flex; gap:16px; align-items:center; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px 14px; }
-.metric { display:flex; flex-direction:column; } .metric .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
-.metric strong { font-size:18px; font-variant-numeric: tabular-nums; } .metric strong.good { color:var(--ok); } .metric strong.bad { color:var(--warn); }
-.toggle { margin-left:auto; font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
-.stats { flex-basis:100%; font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; white-space:pre-wrap; }
+.toggle { font-size:13px; color:var(--muted); display:flex; gap:6px; align-items:center; }
 .transcript { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:4px 2px; }
 .msg { max-width:80%; padding:10px 14px; border-radius:14px; line-height:1.45; white-space:pre-wrap; }
 .msg.bot { background:var(--bot); align-self:flex-start; border-bottom-left-radius:4px; }
